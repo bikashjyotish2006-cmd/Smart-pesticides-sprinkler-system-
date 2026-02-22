@@ -18,7 +18,7 @@ This folder contains the clean, human-written version of the project code.
 
 ## Run Order
 
-1. Start `main.py` on the laptop first.
-2. Start `pi_client.py` on the Pi.
-3. Start `dht22_client.py` on the Pi (separate terminal).
+1. Start `pi_client.py` on the Pi first.
+2. Start `dht22_client.py` on the Pi (separate terminal).
+3. Start `main.py` on the laptop first.
 4. Open `http://<laptop-ip>:5000` in a browser for the dashboard.
