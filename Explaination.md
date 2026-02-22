@@ -96,7 +96,7 @@ Adafruit-DHT       (Raspberry Pi only)
 
 | Component | Details | Role |
 |---|---|---|
-| **Raspberry Pi** (3B+ / 4) | ARM-based Linux SBC | Edge client: sensor reading, camera streaming, motor control |
+| **Raspberry Pi** (3B+ / 4) we have used pi 0 w | ARM-based Linux SBC | Edge client: sensor reading, camera streaming, motor control |
 | **Raspberry Pi Camera Module** | V1 / V2 / HQ | Captures live MJPEG video at 320×240 @ 15fps |
 | **Laptop / Desktop PC** | Any OS (Windows/macOS/Linux) with GPU optional | Runs Flask server + AI inference |
 | **DHT22 Sensor** | Digital temperature & humidity sensor | Reads ambient temperature (°C) and humidity (%) via GPIO 22 |
