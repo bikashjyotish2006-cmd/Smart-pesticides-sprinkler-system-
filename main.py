@@ -7,848 +7,749 @@ import threading
 import time
 from flask import Flask, request, jsonify, render_template_string, Response
 from datetime import datetime
+import requests
 
 
-# -------------------------------------------------------
-# GPU Setup
-# Just telling tensorflow to not grab all GPU memory at once
-# -------------------------------------------------------
+# ========================
+# GPU CONFIGURATION
+# ========================
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"GPU found! Using {len(gpus)} GPU(s).")
+        print(f"SUCCESS: GPU detected: {len(gpus)} GPU(s) available")
     except RuntimeError as e:
-        print(f"GPU setup error: {e}")
+        print(f"WARNING: GPU configuration error: {e}")
 else:
-    print("No GPU found, running on CPU.")
+    print("WARNING: No GPU detected, using CPU")
 
-
-# -------------------------------------------------------
-# Load both AI models
-# First model checks if there's a plant or not
-# Second model tells the disease severity
-# -------------------------------------------------------
-BINARY_MODEL_PATH = "plant_vs_nonplant_mobilenetv2_final.h5"
-SEVERITY_MODEL_PATH = "suraj_chand_severity_mobilenetv2_optimized_final_ooooop.h5"
+# ------------------------------
+# Load models and define constants
+# ------------------------------
+BINARY_MODEL_PATH = r"C:\Users\BIKASH\Desktop\webcam\plant_vs_nonplant_mobilenetv2_final.h5"
+SEVERITY_MODEL_PATH = r"C:\Users\BIKASH\Desktop\webcam\suraj_chand_severity_mobilenetv2_optimized_final_ooooop.h5"
 
 try:
     binary_model = load_model(BINARY_MODEL_PATH, compile=False)
     severity_model = load_model(SEVERITY_MODEL_PATH, compile=False)
-    print("Both models loaded successfully!")
+    print("SUCCESS: Models loaded successfully")
 except Exception as e:
-    print(f"Error loading models: {e}")
+    print(f"ERROR: Error loading models: {e}")
     exit()
 
-# The severity labels our model was trained on
-severity_classes = ['healthy', 'high', 'low', 'medium']
-
-# Image size that MobileNetV2 expects
+SEVERITY_CLASSES = ['healthy', 'high', 'low', 'medium']
 IMG_SIZE = (224, 224)
+BINARY_THRESHOLD = 0.99
+CONF_THRESHOLD = 45.0
+HIGH_CONF_THRESHOLD = 75.0
 
-# If binary prediction is above this, we consider it a plant
-PLANT_DETECTION_THRESHOLD = 0.99
+# Target box size for AI analysis (300x300 center ROI)
+TARGET_SIZE = 300
 
-# Minimum confidence to show a severity result
-MIN_CONFIDENCE = 35.0
+# HD Resolution settings
+HD_WIDTH = 1280
+HD_HEIGHT = 720
 
-# If confidence is above this, it's a strong detection
-HIGH_CONFIDENCE = 75.0
+# Motor activation thresholds
+MOISTURE_THRESHOLD = 40.0  # < 40%
+HUMIDITY_THRESHOLD = 70.0  # < 70%
+TEMP_THRESHOLD = 30.0      # < 30C
 
-# The center crop box we feed to the model (in pixels)
-CROP_SIZE = 300
-
-# HD resolution for display
-FRAME_WIDTH = 1280
-FRAME_HEIGHT = 720
-
-# Motor spray time depends on how bad the disease is
-spray_durations = {
-    'low': 2,    # mild infection, short spray
-    'medium': 3, # moderate, medium spray
-    'high': 5    # severe, long spray
+# Motor run times based on severity (for high-confidence spray)
+SPRAY_RUN_TIMES = {
+    'low': 2,      # 2 sec
+    'medium': 3,   # 3 sec
+    'high': 5      # 5 sec
 }
 
-# Thresholds for deciding if we should water the plant
-MOISTURE_LIMIT = 40.0   # soil moisture below 40% → dry
-HUMIDITY_LIMIT = 70.0   # air humidity below 70%
-TEMP_LIMIT = 30.0       # temperature below 30°C
+# ------------------------------
+# Weather Monitor Globals
+# ------------------------------
+latest_weather = {"condition": "Fetching...", "temp": "--", "city": "Gunupur", "rain_lock": False}
 
+# ------------------------------
+# Motor Status Globals
+# ------------------------------
+motor_state = False  # True when ON, False when OFF
+motor_start_time = 0
+motor_duration = 0
 
-# -------------------------------------------------------
-# Global state variables
-# These get updated from different threads so we need them global
-# -------------------------------------------------------
-motor_running = False
-motor_started_at = 0
-motor_run_for = 0
+# ------------------------------
+# Temporal Smoothing + Hysteresis
+# ------------------------------
+SMOOTH_FRAMES = 20
+ALPHA = 0.1
+HYSTERESIS_THRESHOLD = 5
+history = deque(maxlen=SMOOTH_FRAMES)
+plant_state = False
+no_plant_count = 0
 
-# For smoothing out prediction flickering
-HISTORY_SIZE = 20
-SMOOTHING_ALPHA = 0.1
-HYSTERESIS = 5
-prediction_history = deque(maxlen=HISTORY_SIZE)
-plant_currently_visible = False
-frames_without_plant = 0
-
-# Flask app
+# ------------------------------
+# Flask Globals
+# ------------------------------
 app = Flask(__name__)
-
-# Latest command to send to the Pi
-current_motor_command = "STOP"
-command_duration = 0
-
-# Latest sensor readings (updated when Pi sends data)
+current_command = "STOP"
+current_duration = 0
 latest_moisture = 0.0
 latest_temperature = None
 latest_humidity = None
+latest_plant_data = {"label": "No Plant Detected", "confidence": 0.0}
+force_spray = False  # Global flag for force spray
 
-# Current plant detection result
-latest_plant = {"label": "No Plant Detected", "confidence": 0.0}
+# ------------------------------
+# System Logs (max 50 entries)
+# ------------------------------
+system_logs = deque(maxlen=50)
 
-# Emergency spray flag (set to True when user clicks force spray)
-force_spray_now = False
-
-# Activity log (only keep last 50 entries)
-activity_log = deque(maxlen=50)
-
-# Frame buffers for the producer-consumer threading pattern
-raw_frame_queue = deque(maxlen=1)
-processed_frame_queue = deque(maxlen=1)
-
-# For freeze mode (we freeze the frame when spray triggers)
-freeze_active = False
-saved_frame = None
-spray_in_progress = False
-spray_started_at = 0
-spray_lasts_for = 0
-manual_spray_prompt = ""
-
-
-def log_event(message, level="info"):
-    """Just adds a timestamped message to our log list."""
-    ts = datetime.now().strftime("%H:%M:%S")
-    entry = {
-        "time": ts,
+def add_log(message, log_type="info"):
+    """Add a log entry with timestamp"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    system_logs.append({
+        "time": timestamp,
         "message": message,
-        "type": level  # can be: info, warning, success, error
-    }
-    activity_log.append(entry)
+        "type": log_type  # info, warning, success, error
+    })
 
+# ------------------------------
+# Frame Buffers
+# ------------------------------
+frame_buffer = deque(maxlen=1)
+result_buffer = deque(maxlen=1)
 
-def get_stable_prediction():
-    """
-    Averages recent predictions to avoid flickery output.
-    Uses exponential smoothing and hysteresis so it doesn't flip rapidly.
-    """
-    global plant_currently_visible, frames_without_plant
+# ------------------------------
+# Freeze Mode and Spray Logic
+# ------------------------------
+freeze_mode = False
+frozen_frame = None
+spray_triggered = False
+spray_start_time = 0
+spray_duration = 0
+force_spray_message = ""  # Global for on-screen prompt
 
-    if not prediction_history:
+def get_smoothed_label():
+    global plant_state, no_plant_count
+    if not history:
         return "No Plant Detected", (0, 0, 255), 0.0
-
-    # Exponential moving average of confidence values
-    smoothed = 0.0
-    for i, (_, conf) in enumerate(prediction_history):
-        if i == 0:
-            smoothed = conf
-        else:
-            smoothed = SMOOTHING_ALPHA * conf + (1 - SMOOTHING_ALPHA) * smoothed
-
-    # Find the most common label in recent history
-    valid_labels = [lbl for lbl, _ in prediction_history if lbl != "No Plant Detected"]
-    if valid_labels:
-        most_common = max(set(valid_labels), key=valid_labels.count)
+    smoothed_conf = 0.0
+    for i, (_, conf) in enumerate(history):
+        smoothed_conf = conf if i == 0 else ALPHA * conf + (1 - ALPHA) * smoothed_conf
+    valid_labels = [lbl for lbl, _ in history if lbl != "No Plant Detected"]
+    most_common_label = max(set(valid_labels), key=valid_labels.count) if valid_labels else "No Plant Detected"
+    if smoothed_conf >= CONF_THRESHOLD:
+        plant_state = True
+        no_plant_count = 0
+        return most_common_label, (0, 255, 0), smoothed_conf
     else:
-        most_common = "No Plant Detected"
-
-    if smoothed >= MIN_CONFIDENCE:
-        plant_currently_visible = True
-        frames_without_plant = 0
-        return most_common, (0, 255, 0), smoothed
-    else:
-        frames_without_plant += 1
-        # Hysteresis: keep showing plant for a few frames before saying "no plant"
-        if plant_currently_visible and frames_without_plant < HYSTERESIS:
-            return most_common, (0, 255, 0), smoothed
+        no_plant_count += 1
+        if plant_state and no_plant_count < HYSTERESIS_THRESHOLD:
+            return most_common_label, (0, 255, 0), smoothed_conf
         else:
-            plant_currently_visible = False
-            frames_without_plant = 0
-            return "No Plant Detected", (0, 0, 255), smoothed
+            plant_state = False
+            no_plant_count = 0
+            return "No Plant Detected", (0, 0, 255), smoothed_conf
 
+# ------------------------------
+# Weather Monitor Thread
+# ------------------------------
+def weather_monitor():
+    """Monitor weather from wttr.in and update rain lock status"""
+    global latest_weather
+    
+    while True:
+        try:
+            response = requests.get("https://wttr.in/Gunupur?format=j1", timeout=10)
+            data = response.json()
+            
+            # Parse weather data
+            condition = data["current_condition"][0]["weatherDesc"][0]["value"]
+            temp = data["current_condition"][0]["temp_C"]
+            
+            # Check for rain conditions
+            condition_lower = condition.lower()
+            rain_keywords = ["rain", "drizzle", "shower", "storm"]
+            is_raining = any(keyword in condition_lower for keyword in rain_keywords)
+            
+            # Update rain lock status
+            latest_weather["rain_lock"] = is_raining
+            latest_weather["condition"] = condition
+            latest_weather["temp"] = temp
+            
+            # Log weather update
+            if is_raining:
+                add_log(f"Weather: {condition}, {temp}C - RAIN LOCK ACTIVE", "warning")
+            else:
+                add_log(f"Weather: {condition}, {temp}C - Auto-spray enabled", "info")
+                
+        except Exception as e:
+            print(f"Weather fetch error: {e}")
+            add_log(f"Weather update failed: {str(e)}", "error")
+            latest_weather["condition"] = "Error"
+            latest_weather["rain_lock"] = False
+        
+        # Sleep for 10 minutes before next update
+        time.sleep(600)
 
-def run_motor_spray(severity_level):
+# ------------------------------
+# Spray Motor Function
+# ------------------------------
+def spray_motor(severity):
+    global spray_triggered, spray_start_time, spray_duration, motor_state, freeze_mode, force_spray_message
+    if severity in SPRAY_RUN_TIMES:
+        spray_duration = SPRAY_RUN_TIMES[severity]
+        spray_start_time = time.time()
+        motor_state = True
+        log_msg = f"Motor started for {spray_duration}s - {severity.upper()} severity detected"
+        print(f"Starting spray for {spray_duration}s due to {severity} severity")
+        add_log(log_msg, "success")
+        # Simulate motor run (in real, send command to Pi)
+        time.sleep(spray_duration)
+        motor_state = False
+        print("Spray completed, motor stopped")
+        add_log(f"Motor stopped after {spray_duration}s spray", "info")
+        # Reset freeze mode and spray_triggered after motor stops
+        spray_triggered = False
+        freeze_mode = False
+        force_spray_message = ""  # Clear the on-screen prompt
+
+# ------------------------------
+# UI Crosshair Drawing Function
+# ------------------------------
+def draw_target_ui(frame, target_size=TARGET_SIZE):
     """
-    Turns the motor on for the right amount of time based on severity.
-    Runs in its own thread so it doesn't block the main loop.
-    """
-    global spray_in_progress, spray_started_at, spray_lasts_for
-    global motor_running, freeze_active, manual_spray_prompt
-
-    if severity_level not in spray_durations:
-        return
-
-    duration = spray_durations[severity_level]
-    spray_lasts_for = duration
-    spray_started_at = time.time()
-    motor_running = True
-
-    msg = f"Motor ON for {duration}s — {severity_level.upper()} severity"
-    print(msg)
-    log_event(msg, "success")
-
-    # Actually wait for the spray to finish
-    time.sleep(duration)
-
-    motor_running = False
-    spray_in_progress = False
-    freeze_active = False
-    manual_spray_prompt = ""
-
-    log_event(f"Motor OFF — finished {duration}s spray", "info")
-    print("Motor stopped.")
-
-
-def draw_targeting_box(frame, crop_size=CROP_SIZE):
-    """
-    Draws a fancy crosshair / targeting box on the center of the frame.
-    This visually shows the region the AI is actually analyzing.
+    Draw a high-tech targeting crosshair UI on the frame.
+    Returns the frame with overlay and the ROI coordinates.
     """
     h, w = frame.shape[:2]
+    
+    # Calculate center ROI coordinates
+    start_x = (w - target_size) // 2
+    start_y = (h - target_size) // 2
+    end_x = start_x + target_size
+    end_y = start_y + target_size
+    
+    center_x = w // 2
+    center_y = h // 2
+    
+    # Colors
+    color_primary = (0, 245, 160)  # Emerald green
+    color_secondary = (255, 255, 255)  # White
+    color_dim = (100, 100, 100)  # Gray for subtle elements
+    
+    # Draw corner brackets (L-shaped corners)
+    bracket_length = 40
+    bracket_thickness = 3
+    
+    # Top-left corner
+    cv2.line(frame, (start_x, start_y), (start_x + bracket_length, start_y), color_primary, bracket_thickness)
+    cv2.line(frame, (start_x, start_y), (start_x, start_y + bracket_length), color_primary, bracket_thickness)
+    
+    # Top-right corner
+    cv2.line(frame, (end_x, start_y), (end_x - bracket_length, start_y), color_primary, bracket_thickness)
+    cv2.line(frame, (end_x, start_y), (end_x, start_y + bracket_length), color_primary, bracket_thickness)
+    
+    # Bottom-left corner
+    cv2.line(frame, (start_x, end_y), (start_x + bracket_length, end_y), color_primary, bracket_thickness)
+    cv2.line(frame, (start_x, end_y), (start_x, end_y - bracket_length), color_primary, bracket_thickness)
+    
+    # Bottom-right corner
+    cv2.line(frame, (end_x, end_y), (end_x - bracket_length, end_y), color_primary, bracket_thickness)
+    cv2.line(frame, (end_x, end_y), (end_x, end_y - bracket_length), color_primary, bracket_thickness)
+    
+    # Draw center crosshair
+    crosshair_size = 15
+    cv2.line(frame, (center_x - crosshair_size, center_y), (center_x + crosshair_size, center_y), color_secondary, 2)
+    cv2.line(frame, (center_x, center_y - crosshair_size), (center_x, center_y + crosshair_size), color_secondary, 2)
+    
+    # Draw center dot
+    cv2.circle(frame, (center_x, center_y), 4, color_primary, -1)
+    cv2.circle(frame, (center_x, center_y), 6, color_secondary, 1)
+    
+    # Draw subtle grid lines (dotted effect using multiple small lines)
+    dash_spacing = 20
+    for i in range(start_x + dash_spacing, end_x, dash_spacing * 2):
+        cv2.line(frame, (i, start_y), (i + dash_spacing, start_y), color_dim, 1)
+        cv2.line(frame, (i, end_y), (i + dash_spacing, end_y), color_dim, 1)
+    
+    for i in range(start_y + dash_spacing, end_y, dash_spacing * 2):
+        cv2.line(frame, (start_x, i), (start_x, i + dash_spacing), color_dim, 1)
+        cv2.line(frame, (end_x, i), (end_x, i + dash_spacing), color_dim, 1)
+    
+    # Draw text labels
+    label_text = f"AI ANALYSIS ZONE - {target_size}x{target_size}"
+    cv2.putText(frame, label_text, (start_x, start_y - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_primary, 2)
+    
+    # Draw pixel dimensions at corners
+    cv2.putText(frame, f"{target_size}px", (start_x, start_y - 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_secondary, 1)
+    
+    return frame, (start_x, start_y, end_x, end_y)
 
-    # Calculate where the center crop box starts and ends
-    x1 = (w - crop_size) // 2
-    y1 = (h - crop_size) // 2
-    x2 = x1 + crop_size
-    y2 = y1 + crop_size
-
-    cx = w // 2
-    cy = h // 2
-
-    green = (0, 245, 160)
-    white = (255, 255, 255)
-    gray = (100, 100, 100)
-    bracket_len = 40
-    thickness = 3
-
-    # Draw the 4 corner L-shaped brackets
-    # Top-left
-    cv2.line(frame, (x1, y1), (x1 + bracket_len, y1), green, thickness)
-    cv2.line(frame, (x1, y1), (x1, y1 + bracket_len), green, thickness)
-    # Top-right
-    cv2.line(frame, (x2, y1), (x2 - bracket_len, y1), green, thickness)
-    cv2.line(frame, (x2, y1), (x2, y1 + bracket_len), green, thickness)
-    # Bottom-left
-    cv2.line(frame, (x1, y2), (x1 + bracket_len, y2), green, thickness)
-    cv2.line(frame, (x1, y2), (x1, y2 - bracket_len), green, thickness)
-    # Bottom-right
-    cv2.line(frame, (x2, y2), (x2 - bracket_len, y2), green, thickness)
-    cv2.line(frame, (x2, y2), (x2, y2 - bracket_len), green, thickness)
-
-    # Small crosshair in the center
-    cross = 15
-    cv2.line(frame, (cx - cross, cy), (cx + cross, cy), white, 2)
-    cv2.line(frame, (cx, cy - cross), (cx, cy + cross), white, 2)
-    cv2.circle(frame, (cx, cy), 4, green, -1)
-    cv2.circle(frame, (cx, cy), 6, white, 1)
-
-    # Dashed border lines for style
-    dash_gap = 20
-    for i in range(x1 + dash_gap, x2, dash_gap * 2):
-        cv2.line(frame, (i, y1), (i + dash_gap, y1), gray, 1)
-        cv2.line(frame, (i, y2), (i + dash_gap, y2), gray, 1)
-    for i in range(y1 + dash_gap, y2, dash_gap * 2):
-        cv2.line(frame, (x1, i), (x1, i + dash_gap), gray, 1)
-        cv2.line(frame, (x2, i), (x2, i + dash_gap), gray, 1)
-
-    # Label above the box
-    cv2.putText(frame, f"AI ANALYSIS ZONE - {crop_size}x{crop_size}",
-                (x1, y1 - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, green, 2)
-
-    return frame, (x1, y1, x2, y2)
-
-
-def process_frames_loop():
-    """
-    Background thread that pulls frames from the queue,
-    runs both AI models, and pushes the result back.
-    """
-    global motor_running, freeze_active, spray_in_progress
-
+# ------------------------------
+# Multi-threaded frame processing
+# ------------------------------
+def process_frame():
+    global motor_state, freeze_mode, spray_triggered
     while True:
-        if not raw_frame_queue:
-            time.sleep(0.01)
-            continue
-
-        frame = raw_frame_queue.popleft()
-        h, w = frame.shape[:2]
-
-        # Get the center crop coordinates
-        x1 = (w - CROP_SIZE) // 2
-        y1 = (h - CROP_SIZE) // 2
-        x2 = x1 + CROP_SIZE
-        y2 = y1 + CROP_SIZE
-
-        # Crop and preprocess the center region for the model
-        crop = frame[y1:y2, x1:x2]
-        resized = cv2.resize(crop, IMG_SIZE)
-        normalized = resized.astype(np.float32) / 255.0
-        model_input = np.expand_dims(normalized, axis=0)
-
-        # Step 1 — Is there a plant?
-        plant_prob = binary_model.predict(model_input, verbose=0)[0][0]
-
-        if plant_prob > PLANT_DETECTION_THRESHOLD:
-            # Step 2 — What severity is the disease?
-            severity_preds = severity_model.predict(model_input, verbose=0)
-            class_idx = int(np.argmax(severity_preds))
-            confidence = float(np.max(severity_preds) * 100)
-            label = f"{severity_classes[class_idx]} ({confidence:.1f}%)"
-            prediction_history.append((label, confidence))
-        else:
-            prediction_history.append(("No Plant Detected", 0.0))
-
-        # Get the smoothed/stable result
-        stable_label, label_color, stable_conf = get_stable_prediction()
-
-        # Apply the targeting UI overlay
-        display = frame.copy()
-        display, box_coords = draw_targeting_box(display, CROP_SIZE)
-        _, _, _, result_y_top = box_coords
-        text_y = result_y_top + 40
-
-        # Write the prediction result on the frame
-        cv2.putText(display, f"Plant: {stable_label}",
-                    (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, label_color, 2)
-        cv2.putText(display, f"Confidence: {stable_conf:.1f}%",
-                    (x1, text_y + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        # Update the global so the Flask route can read it
-        latest_plant["label"] = stable_label
-        latest_plant["confidence"] = stable_conf
-
-        # Auto-spray logic — if conditions are right, trigger the motor
-        detected_severity = stable_label.split(" ")[0]
-        conditions_met = (
-            detected_severity in spray_durations
-            and latest_moisture < MOISTURE_LIMIT
-            and latest_humidity is not None and latest_humidity < HUMIDITY_LIMIT
-            and latest_temperature is not None and latest_temperature < TEMP_LIMIT
-            and not motor_running
-        )
-        if conditions_met:
-            t = threading.Thread(target=run_motor_spray, args=(detected_severity,), daemon=True)
-            t.start()
-
-        # Push the rendered frame to the output queue
-        processed_frame_queue.append((stable_label, label_color, stable_conf, display))
+        if frame_buffer:
+            frame = frame_buffer.popleft()
+            
+            # Get frame dimensions
+            h, w = frame.shape[:2]
+            
+            # Calculate center ROI for AI analysis
+            start_x = (w - TARGET_SIZE) // 2
+            start_y = (h - TARGET_SIZE) // 2
+            end_x = start_x + TARGET_SIZE
+            end_y = start_y + TARGET_SIZE
+            
+            # Extract ROI for AI analysis only
+            roi = frame[start_y:end_y, start_x:end_x]
+            
+            # Prepare for model (resize ROI to 224x224)
+            img = cv2.resize(roi, IMG_SIZE).astype(np.float32) / 255.0
+            img = np.expand_dims(img, axis=0)
+            
+            # Step 1: Binary Model (Plant vs Non-Plant)
+            binary_pred = binary_model.predict(img, verbose=0)[0][0]
+            
+            if binary_pred > BINARY_THRESHOLD:
+                # Step 2: Severity Model
+                preds = severity_model.predict(img, verbose=0)
+                class_id = int(np.argmax(preds))
+                confidence = float(np.max(preds) * 100)
+                label = f"{SEVERITY_CLASSES[class_id]} ({confidence:.1f}%)"
+                history.append((label, confidence))
+            else:
+                history.append(("No Plant Detected", 0.0))
+            
+            smoothed_label, smoothed_color, smoothed_conf = get_smoothed_label()
+            
+            # Create a copy of the original HD frame for display
+            display_frame = frame.copy()
+            
+            # Draw the targeting UI overlay on the full HD frame
+            display_frame, roi_coords = draw_target_ui(display_frame, TARGET_SIZE)
+            
+            # Draw detection results overlay (positioned below the target box)
+            result_y = end_y + 40
+            cv2.putText(display_frame, f"Plant: {smoothed_label}", (start_x, result_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, smoothed_color, 2)
+            
+            cv2.putText(display_frame, f"Confidence: {smoothed_conf:.1f}%", (start_x, result_y + 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Update latest plant data for dashboard
+            latest_plant_data["label"] = smoothed_label
+            latest_plant_data["confidence"] = smoothed_conf
+            
+            # Auto Motor Trigger - with Rain Lock check
+            severity = smoothed_label.split(" ")[0]
+            if (severity in SPRAY_RUN_TIMES and
+                latest_moisture < MOISTURE_THRESHOLD and
+                (latest_humidity is not None and latest_humidity < HUMIDITY_THRESHOLD) and
+                (latest_temperature is not None and latest_temperature < TEMP_THRESHOLD) and
+                not motor_state and
+                not latest_weather["rain_lock"]):  # Rain Lock check added
+                threading.Thread(target=spray_motor, args=(severity,), daemon=True).start()
+            
+            result_buffer.append((smoothed_label, smoothed_color, smoothed_conf, display_frame))
+        
         time.sleep(0.01)
 
-
-def generate_mjpeg_stream():
-    """
-    Generator function for the MJPEG stream.
-    Flask uses this to serve /video_feed as a multipart response.
-    """
+def generate_frames():
     while True:
-        if processed_frame_queue:
-            label, color, conf, frame = processed_frame_queue[-1]
-            success, encoded = cv2.imencode('.jpg', frame)
-            if success:
-                frame_bytes = encoded.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        if result_buffer:
+            label, color, confidence, frame = result_buffer[-1]
+            
+            ret, buffer = cv2.imencode('.jpg', frame)
+            frame_bytes = buffer.tobytes()
+            
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         time.sleep(0.03)
 
-
-# -------------------------------------------------------
+# ------------------------------
 # Flask Routes
-# -------------------------------------------------------
-
+# ------------------------------
 @app.route('/process', methods=['POST'])
-def handle_moisture_data():
-    """
-    Pi sends moisture + asks what the motor should do.
-    We check conditions and reply with a command.
-    """
-    global current_motor_command, command_duration, latest_moisture, force_spray_now
-
+def process():
+    global current_command, current_duration, latest_moisture, force_spray
     data = request.json
     latest_moisture = data.get('moisture', 0.0)
-    print(f"[PI] Moisture received: {latest_moisture}%")
-
-    plant_label = latest_plant.get("label", "").split(" ")[0]
-
-    if force_spray_now:
-        # Someone pressed the emergency spray button
-        current_motor_command = "RUN"
-        command_duration = 3
-        force_spray_now = False
-        print("Force spray triggered via dashboard.")
-        log_event("Manual override — Force spray for 3s", "warning")
+    print(f"\n--- [PI DATA] Moisture: {latest_moisture}% ---")
+    plant_label = latest_plant_data.get("label", "").split(" ")[0]
+    
+    # Check for force spray first
+    if force_spray:
+        current_command = "RUN"
+        current_duration = 3  # Force spray for 3 seconds
+        force_spray = False  # Reset after sending
+        print("Force spray activated via 'S' key -> Motor RUN for 3s")
+        add_log("Force spray activated - Motor RUN for 3s", "warning")
     else:
-        # Normal auto logic
-        all_conditions_ok = (
-            plant_label in spray_durations
-            and plant_label != "No Plant Detected"
-            and latest_moisture < MOISTURE_LIMIT
-            and latest_humidity is not None and latest_humidity < HUMIDITY_LIMIT
-            and latest_temperature is not None and latest_temperature < TEMP_LIMIT
-        )
-        if all_conditions_ok:
-            current_motor_command = "RUN"
-            command_duration = spray_durations[plant_label]
-            print(f"Auto trigger: {plant_label} severity, motor ON for {command_duration}s")
-            log_event(f"Auto spray: {plant_label}, {command_duration}s", "success")
+        # Normal logic: Plant detected AND all thresholds met AND no rain lock
+        if (plant_label in SPRAY_RUN_TIMES and plant_label != "No Plant Detected" and
+            latest_moisture < MOISTURE_THRESHOLD and
+            (latest_humidity is not None and latest_humidity < HUMIDITY_THRESHOLD) and
+            (latest_temperature is not None and latest_temperature < TEMP_THRESHOLD) and
+            not latest_weather["rain_lock"]):  # Rain Lock check added
+            current_command = "RUN"
+            current_duration = SPRAY_RUN_TIMES[plant_label]
+            print(f"Plant detected ({plant_label}), Conditions met -> Motor RUN for {current_duration}s")
+            add_log(f"Auto-trigger: {plant_label} severity, conditions met", "success")
         else:
-            current_motor_command = "STOP"
-            command_duration = 0
-
-    return jsonify({"motor_command": current_motor_command, "duration": command_duration})
-
+            current_command = "STOP"
+            current_duration = 0
+            print("No action: Conditions not met")
+    
+    return jsonify({"motor_command": current_command, "duration": current_duration})
 
 @app.route('/dht22', methods=['POST'])
-def handle_dht22_data():
-    """Receives temperature and humidity from the Pi's DHT22 sensor."""
+def dht22():
     global latest_temperature, latest_humidity
-
     data = request.json
     latest_temperature = data.get('temperature')
     latest_humidity = data.get('humidity')
-    print(f"[DHT22] Temp: {latest_temperature}°C, Humidity: {latest_humidity}%")
-
+    print(f"--- [DHT22 DATA] Temperature: {latest_temperature}C, Humidity: {latest_humidity}% ---")
     return jsonify({"status": "received"})
-
 
 @app.route('/logs')
 def get_logs():
-    """Returns the activity log as JSON so the dashboard can display it."""
-    return jsonify(list(activity_log))
-
-
-@app.route('/status')
-def get_status():
-    """Quick status endpoint the dashboard polls every second."""
-    return jsonify({
-        "plant": latest_plant.get("label", "N/A"),
-        "confidence": latest_plant.get("confidence", 0.0),
-        "moisture": latest_moisture,
-        "temperature": latest_temperature,
-        "humidity": latest_humidity,
-        "motor": "ON" if motor_running else "OFF"
-    })
-
-
-@app.route('/force_spray', methods=['POST'])
-def trigger_force_spray():
-    """Dashboard button hit — set the flag so next Pi request triggers a spray."""
-    global force_spray_now
-    force_spray_now = True
-    log_event("Force spray requested from dashboard", "warning")
-    return jsonify({"status": "queued"})
-
-
-@app.route('/video_feed')
-def video_feed():
-    """Streams the processed webcam frames as MJPEG."""
-    return Response(
-        generate_mjpeg_stream(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+    """Return system logs"""
+    return jsonify(list(system_logs))
 
 
 @app.route('/')
 def dashboard():
-    """Serves the main web dashboard."""
-    html_page = """
+    return """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Plant AI Monitor | Intelligent Sprayer System</title>
+    <title>Intelligent Sprayer System | Plant AI Monitor Pro</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
-            --green:       #00f5a0;
-            --green-dark:  #00c97f;
-            --green-glow:  rgba(0, 245, 160, 0.4);
-            --red:         #ff3b5c;
-            --red-glow:    rgba(255, 59, 92, 0.4);
-            --amber:       #ffb020;
-            --amber-glow:  rgba(255, 176, 32, 0.4);
-            --blue:        #3da9ff;
-            --blue-glow:   rgba(61, 169, 255, 0.4);
-            --violet:      #8b5cf6;
-            --bg:          #060b14;
-            --bg-card:     #0f1724;
-            --bg-glass:    rgba(15, 23, 36, 0.6);
-            --text:        #e6edf6;
-            --text-dim:    #9fb3c8;
-            --text-muted:  #6b8098;
-            --border:      rgba(80, 120, 160, 0.15);
-            --radius:      16px;
-            --transition:  all 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+            --emerald-primary: #00f5a0; --emerald-dark: #00c97f; --emerald-light: #5fffd1; --emerald-glow: rgba(0, 245, 160, 0.45);
+            --alert-red: #ff3b5c; --alert-red-dark: #d91e3f; --alert-red-glow: rgba(255, 59, 92, 0.45);
+            --warning-amber: #ffb020; --warning-glow: rgba(255, 176, 32, 0.4);
+            --info-blue: #3da9ff; --info-glow: rgba(61, 169, 255, 0.45);
+            --automation-violet: #8b5cf6; --automation-glow: rgba(139, 92, 246, 0.4);
+            --bg-dark: #060b14; --bg-darker: #04080f; --bg-card: #0f1724; --bg-card-hover: #162132;
+            --bg-glass: rgba(15, 23, 36, 0.55); --bg-glass-strong: rgba(15, 23, 36, 0.75);
+            --text-primary: #e6edf6; --text-secondary: #9fb3c8; --text-muted: #6b8098;
+            --border-color: rgba(80, 120, 160, 0.15); --border-light: rgba(120, 170, 220, 0.25);
+            --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.35); --shadow-md: 0 12px 28px rgba(0, 0, 0, 0.45);
+            --gradient-primary: linear-gradient(135deg, #00f5a0 0%, #00c97f 100%);
+            --gradient-danger: linear-gradient(135deg, #ff3b5c 0%, #d91e3f 100%);
+            --gradient-warning: linear-gradient(135deg, #ffb020 0%, #ff8c00 100%);
+            --gradient-info: linear-gradient(135deg, #3da9ff 0%, #2563eb 100%);
+            --radius-sm: 10px; --radius-md: 16px; --radius-lg: 22px;
+            --transition-smooth: all 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+            --blur-glass: blur(18px); --blur-strong: blur(28px);
+            --status-online: #00f5a0; --status-offline: #ff3b5c; --status-idle: #ffb020; --status-processing: #3da9ff;
         }
-
         *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
-        html { scroll-behavior: smooth; }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background: linear-gradient(145deg, #04080f, #060b14);
-            background-attachment: fixed;
-            color: var(--text);
-            min-height: 100vh;
-            overflow-x: hidden;
+        html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; }
+        body { 
+            font-family: 'Inter', system-ui, sans-serif;
+            background: radial-gradient(circle at 20% 20%, rgba(0,245,160,0.05), transparent 40%), radial-gradient(circle at 80% 70%, rgba(61,169,255,0.05), transparent 50%), linear-gradient(145deg, var(--bg-darker), var(--bg-dark));
+            color: var(--text-primary); min-height: 100vh; overflow-x: hidden; line-height: 1.6; letter-spacing: 0.2px; background-attachment: fixed;
         }
-
-        /* Subtle grid background */
-        body::before {
-            content: "";
-            position: fixed; inset: 0;
-            pointer-events: none;
-            background-image:
-                linear-gradient(rgba(0,245,160,0.04) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(0,245,160,0.04) 1px, transparent 1px);
-            background-size: 60px 60px;
-            animation: grid-drift 40s linear infinite;
-            z-index: -1;
+        body::before { content: ""; position: fixed; inset: 0; pointer-events: none; background-image: linear-gradient(rgba(0, 245, 160, 0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(0, 245, 160, 0.05) 1px, transparent 1px); background-size: 60px 60px; z-index: -1; opacity: 0.6; animation: gridDrift 40s linear infinite; }
+        @keyframes gridDrift { 0% { transform: translate(0, 0); } 100% { transform: translate(-60px, -60px); } }
+        
+        .mission-header { background: linear-gradient(145deg, var(--bg-glass-strong), var(--bg-card)), radial-gradient(circle at 20% 50%, rgba(0, 245, 160, 0.08), transparent 60%); backdrop-filter: var(--blur-glass); border-bottom: 1px solid var(--border-light); box-shadow: var(--shadow-md), inset 0 -1px 0 rgba(0, 245, 160, 0.15); padding: 1.2rem 0; position: relative; overflow: hidden; z-index: 5; }
+        .mission-header::before { content: ""; position: absolute; bottom: 0; left: -50%; width: 50%; height: 2px; background: var(--gradient-primary); animation: headerScan 6s linear infinite; }
+        @keyframes headerScan { 0% { left: -50%; } 100% { left: 100%; } }
+        .project-title { font-size: 1.6rem; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; background: linear-gradient(135deg, #ffffff 0%, var(--text-primary) 40%, var(--emerald-light) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: titleGlow 3s ease-in-out infinite alternate; }
+        @keyframes titleGlow { from { filter: drop-shadow(0 0 5px rgba(0, 245, 160, 0.3)); } to { filter: drop-shadow(0 0 15px rgba(0, 245, 160, 0.6)); } }
+        .team-badge { background: var(--gradient-primary); color: #04110c; padding: 0.4rem 0.85rem; border-radius: 999px; font-size: 0.72rem; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; border: 1px solid rgba(0, 245, 160, 0.35); box-shadow: 0 0 12px rgba(0, 245, 160, 0.35); animation: badgePulse 2s ease-in-out infinite; }
+        @keyframes badgePulse { 0%, 100% { box-shadow: 0 0 12px rgba(0, 245, 160, 0.35); } 50% { box-shadow: 0 0 20px rgba(0, 245, 160, 0.6); } }
+        
+        .status-indicator { display: inline-flex; align-items: center; gap: 0.6rem; font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); padding: 0.35rem 0.6rem; border-radius: var(--radius-sm); background: rgba(0, 245, 160, 0.04); border: 1px solid rgba(0, 245, 160, 0.08); backdrop-filter: var(--blur-glass); transition: all 0.3s ease; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--status-online); box-shadow: 0 0 8px var(--status-online), 0 0 16px rgba(0, 245, 160, 0.4); animation: pulseCore 2.5s ease-in-out infinite; position: relative; }
+        .status-dot::before { content: ""; position: absolute; inset: -6px; border-radius: 50%; border: 1px solid rgba(0, 245, 160, 0.4); animation: pulseRing 2.5s ease-out infinite; }
+        @keyframes pulseCore { 0%, 100% { transform: scale(1); box-shadow: 0 0 8px var(--status-online), 0 0 16px rgba(0, 245, 160, 0.4); } 50% { transform: scale(1.15); box-shadow: 0 0 14px var(--status-online), 0 0 28px rgba(0, 245, 160, 0.6); } }
+        @keyframes pulseRing { 0% { transform: scale(0.6); opacity: 0.7; } 70% { transform: scale(1.6); opacity: 0; } 100% { opacity: 0; } }
+        .status-dot.offline { background: var(--status-offline); animation: alertFlicker 1.8s infinite; }
+        @keyframes alertFlicker { 0%, 100% { opacity: 1; } 10% { opacity: 0.6; } 20% { opacity: 1; } 40% { opacity: 0.7; } 60% { opacity: 1; } 80% { opacity: 0.85; } }
+        
+        /* Weather Widget Styles */
+        .weather-widget { display: inline-flex; align-items: center; gap: 0.75rem; font-size: 0.85rem; font-weight: 500; color: var(--text-secondary); padding: 0.4rem 0.85rem; border-radius: var(--radius-sm); background: rgba(61, 169, 255, 0.08); border: 1px solid rgba(61, 169, 255, 0.15); backdrop-filter: var(--blur-glass); transition: all 0.3s ease; margin-right: 1rem; }
+        .weather-widget:hover { transform: translateY(-2px); border-color: rgba(61, 169, 255, 0.3); }
+        .weather-widget.rain-lock { background: rgba(255, 59, 92, 0.12); border-color: rgba(255, 59, 92, 0.4); animation: rainLockPulse 1.5s ease-in-out infinite; }
+        @keyframes rainLockPulse { 0%, 100% { box-shadow: 0 0 10px rgba(255, 59, 92, 0.3); } 50% { box-shadow: 0 0 20px rgba(255, 59, 92, 0.5); } }
+        .weather-widget.rain-lock .weather-icon { color: var(--alert-red); animation: rainIconShake 0.5s ease-in-out infinite; }
+        @keyframes rainIconShake { 0%, 100% { transform: rotate(-5deg); } 50% { transform: rotate(5deg); } }
+        .weather-icon { font-size: 1.1rem; color: var(--info-blue); }
+        .weather-temp { font-weight: 700; color: var(--text-primary); }
+        .weather-condition { color: var(--text-secondary); }
+        .weather-city { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+        .rain-lock-badge { background: var(--gradient-danger); color: white; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; animation: badgeFlash 1s ease-in-out infinite; }
+        @keyframes badgeFlash { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+        
+        /* Language Selector Styles */
+        .lang-selector { 
+            display: inline-flex; 
+            align-items: center; 
+            gap: 0.5rem; 
+            font-size: 0.85rem; 
+            font-weight: 500; 
+            color: var(--text-secondary); 
+            padding: 0.4rem 0.75rem; 
+            border-radius: var(--radius-sm); 
+            background: rgba(139, 92, 246, 0.1); 
+            border: 1px solid rgba(139, 92, 246, 0.25); 
+            backdrop-filter: var(--blur-glass); 
+            transition: all 0.3s ease; 
         }
-        @keyframes grid-drift { to { transform: translate(-60px, -60px); } }
-
-        /* ---- HEADER ---- */
-        .top-bar {
-            background: rgba(15, 23, 36, 0.75);
-            backdrop-filter: blur(18px);
-            border-bottom: 1px solid rgba(120, 170, 220, 0.2);
-            padding: 1.1rem 0;
-            position: relative;
-            overflow: hidden;
+        .lang-selector:hover { 
+            border-color: rgba(139, 92, 246, 0.5); 
+            box-shadow: 0 0 15px rgba(139, 92, 246, 0.2); 
         }
-        .top-bar::after {
-            content: "";
-            position: absolute; bottom: 0; left: -60%;
-            width: 50%; height: 2px;
-            background: linear-gradient(90deg, transparent, var(--green), transparent);
-            animation: scan 6s linear infinite;
-        }
-        @keyframes scan { to { left: 110%; } }
-
-        .site-title {
-            font-size: 1.55rem; font-weight: 800;
-            letter-spacing: 1px; text-transform: uppercase;
-            background: linear-gradient(135deg, #fff, var(--green));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .system-badge {
-            background: linear-gradient(135deg, var(--green), var(--green-dark));
-            color: #03110a;
-            padding: 0.35rem 0.8rem;
-            border-radius: 999px;
-            font-size: 0.7rem; font-weight: 700;
-            letter-spacing: 1.2px; text-transform: uppercase;
-            animation: badge-glow 2s ease-in-out infinite alternate;
-        }
-        @keyframes badge-glow {
-            from { box-shadow: 0 0 10px var(--green-glow); }
-            to   { box-shadow: 0 0 22px var(--green-glow); }
-        }
-
-        .online-dot {
-            width: 10px; height: 10px;
-            border-radius: 50%;
-            background: var(--green);
-            box-shadow: 0 0 10px var(--green);
-            animation: dot-pulse 2.5s ease-in-out infinite;
-        }
-        @keyframes dot-pulse {
-            0%, 100% { transform: scale(1); }
-            50%       { transform: scale(1.2); box-shadow: 0 0 18px var(--green); }
-        }
-
-        /* ---- KPI CARDS ---- */
-        .kpi-card {
-            background: linear-gradient(145deg, rgba(15,23,36,0.8), var(--bg-card));
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            padding: 1.5rem;
-            position: relative; overflow: hidden;
-            backdrop-filter: blur(14px);
-            transition: var(--transition);
+        .lang-selector select {
+            background: transparent;
+            border: none;
+            color: var(--text-primary);
+            font-size: 0.85rem;
+            font-weight: 600;
             cursor: pointer;
-            height: 100%;
+            outline: none;
+            padding-right: 0.5rem;
         }
-        .kpi-card::before {
-            content: "";
-            position: absolute; top: 0; left: 0;
-            width: 100%; height: 2px;
-            background: linear-gradient(90deg, transparent, var(--green), transparent);
-            transform: scaleX(0); transform-origin: left;
-            transition: transform 0.4s ease;
-        }
-        .kpi-card:hover { transform: translateY(-7px); border-color: rgba(0,245,160,0.35); }
-        .kpi-card:hover::before { transform: scaleX(1); }
-
-        .kpi-icon {
-            width: 48px; height: 48px;
-            border-radius: 12px;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 1.15rem;
-            margin-bottom: 1rem;
-            border: 1px solid rgba(0,245,160,0.15);
-            background: rgba(0,245,160,0.07);
-            transition: var(--transition);
-        }
-        .kpi-card:hover .kpi-icon { transform: scale(1.1) rotate(5deg); }
-
-        .kpi-icon.green  { color: var(--green);  border-color: rgba(0,245,160,0.3);  background: rgba(0,245,160,0.1);  }
-        .kpi-icon.red    { color: var(--red);    border-color: rgba(255,59,92,0.3);  background: rgba(255,59,92,0.1);  }
-        .kpi-icon.blue   { color: var(--blue);   border-color: rgba(61,169,255,0.3); background: rgba(61,169,255,0.1); }
-        .kpi-icon.amber  { color: var(--amber);  border-color: rgba(255,176,32,0.3); background: rgba(255,176,32,0.1); }
-        .kpi-icon.cyan   { color: #22d3ee;       border-color: rgba(34,211,238,0.3); background: rgba(34,211,238,0.1); }
-        .kpi-icon.violet { color: var(--violet); border-color: rgba(139,92,246,0.3); background: rgba(139,92,246,0.1); }
-
-        .kpi-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 1.3px; color: var(--text-dim); margin-bottom: 0.5rem; }
-        .kpi-value { font-size: 1.85rem; font-weight: 800; line-height: 1.1; margin-bottom: 0.3rem; transition: transform 0.3s ease; }
-        .kpi-card:hover .kpi-value { transform: scale(1.04); }
-        .kpi-value.green  { color: var(--green); }
-        .kpi-value.blue   { color: var(--blue); }
-        .kpi-value.amber  { color: var(--amber); }
-        .kpi-value.red    { color: var(--red); }
-        .kpi-subtext { font-size: 0.82rem; color: var(--text-dim); }
-
-        /* ---- FORCE SPRAY SECTION ---- */
-        .force-spray-box {
-            background: linear-gradient(145deg, rgba(255,59,92,0.08), rgba(255,59,92,0.02));
-            border: 1px solid rgba(255,59,92,0.25);
-            border-radius: var(--radius);
-            padding: 1.4rem;
-            margin-bottom: 1.5rem;
-            animation: spray-box-pulse 3s ease-in-out infinite;
-        }
-        @keyframes spray-box-pulse {
-            0%, 100% { border-color: rgba(255,59,92,0.25); }
-            50%       { border-color: rgba(255,59,92,0.5); box-shadow: 0 0 25px rgba(255,59,92,0.15); }
-        }
-
-        .force-btn {
-            width: 100%; padding: 0.9rem 1.4rem;
-            border: none; border-radius: 12px;
-            background: linear-gradient(135deg, var(--red), #d91e3f);
-            color: #fff; font-weight: 700; font-size: 0.95rem;
-            text-transform: uppercase; letter-spacing: 1px;
-            cursor: pointer;
-            display: flex; align-items: center; justify-content: center; gap: 0.7rem;
-            box-shadow: 0 0 15px var(--red-glow);
-            transition: var(--transition);
-            animation: btn-pulse 2s ease-in-out infinite;
-        }
-        @keyframes btn-pulse {
-            0%, 100% { box-shadow: 0 0 15px var(--red-glow); }
-            50%       { box-shadow: 0 0 28px var(--red-glow); }
-        }
-        .force-btn:hover:not(:disabled) { transform: translateY(-3px) scale(1.02); }
-        .force-btn:disabled { opacity: 0.55; cursor: not-allowed; animation: none; }
-
-        /* ---- CAMERA & OPERATION PANEL ---- */
-        .panel {
-            background: linear-gradient(180deg, rgba(255,255,255,0.015), transparent), var(--bg-card);
-            border: 1px solid var(--border);
-            border-radius: 20px;
-            overflow: hidden;
-            transition: var(--transition);
-        }
-        .panel:hover { transform: translateY(-4px); border-color: rgba(255,255,255,0.1); }
-
-        .panel-header {
-            background: linear-gradient(135deg, rgba(0,245,160,0.08), transparent);
-            padding: 1rem 1.5rem;
-            border-bottom: 1px solid var(--border);
-            display: flex; align-items: center; gap: 0.75rem;
-            position: relative;
-        }
-        .panel-header::before {
-            content: "";
-            position: absolute; left: 0; top: 0; bottom: 0;
-            width: 4px;
-            background: var(--green);
-            box-shadow: 0 0 15px var(--green-glow);
-        }
-        .panel-header h5 { margin: 0; font-weight: 600; font-size: 1rem; }
-
-        /* ---- LIVE FEED ---- */
-        .camera-box {
-            position: relative;
-            background: #000;
-            border-radius: 12px;
-            overflow: hidden;
-            aspect-ratio: 16/9;
-            border: 1px solid rgba(255,255,255,0.06);
-        }
-        .camera-box img { width: 100%; height: 100%; object-fit: cover; min-height: 280px; }
-
-        .live-badge {
-            position: absolute; top: 10px; left: 10px;
-            background: linear-gradient(135deg, var(--red), rgba(255,59,92,0.85));
-            color: #fff; padding: 0.28rem 0.75rem;
-            border-radius: 6px; font-size: 0.68rem; font-weight: 700;
-            letter-spacing: 1.1px; z-index: 10;
-            animation: live-blink 1.5s ease-in-out infinite;
-        }
-        @keyframes live-blink {
-            0%, 100% { opacity: 1; } 50% { opacity: 0.75; }
-        }
-
-        .detection-bar {
-            position: absolute; bottom: 10px; left: 10px; right: 10px;
-            background: rgba(6, 11, 20, 0.9);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(0,245,160,0.25);
-            border-radius: 10px;
-            padding: 0.7rem 1rem;
-            display: flex; align-items: center; gap: 0.7rem;
-            z-index: 10;
-        }
-        .detection-label { font-weight: 700; font-size: 0.85rem; text-transform: uppercase; }
-        .detection-label.healthy { color: var(--green); }
-        .detection-label.infected { color: var(--red); }
-        .detection-label.warning  { color: var(--amber); }
-        .detection-conf { margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: var(--text-dim); }
-
-        /* ---- SPRAY DURATION PANEL ---- */
-        .duration-panel {
-            background: linear-gradient(145deg, rgba(15,23,36,0.8), var(--bg-card));
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            padding: 1.4rem;
-            height: 100%;
-            backdrop-filter: blur(14px);
-        }
-        .duration-row {
-            display: flex; align-items: center; justify-content: space-between;
-            padding: 0.8rem 0.9rem;
-            margin-bottom: 0.7rem;
-            border-radius: 10px;
-            background: rgba(255,255,255,0.025);
-            border: 1px solid rgba(255,255,255,0.05);
-            transition: transform 0.25s ease;
-        }
-        .duration-row:hover { transform: translateX(7px); }
-        .duration-row.low    { border-left: 4px solid var(--amber); }
-        .duration-row.medium { border-left: 4px solid #f97316; }
-        .duration-row.high   { border-left: 4px solid var(--red); }
-
-        .sev-badge {
-            padding: 0.3rem 0.7rem; border-radius: 6px;
-            font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
-        }
-        .sev-badge.low    { background: rgba(255,176,32,0.2); color: var(--amber); }
-        .sev-badge.medium { background: rgba(249,115,22,0.2); color: #f97316; }
-        .sev-badge.high   { background: rgba(255,59,92,0.2);  color: var(--red); }
-
-        .sev-time { font-family: 'JetBrains Mono', monospace; font-size: 1.25rem; font-weight: 700; }
-
-        /* ---- CHART ---- */
-        .chart-box {
-            background: rgba(15, 23, 36, 0.9);
-            border: 1px solid var(--green-glow);
-            border-radius: 20px;
-            padding: 1.5rem;
-            height: 360px;
-            box-shadow: 0 4px 20px rgba(0,245,160,0.15);
-            backdrop-filter: blur(12px);
-        }
-
-        /* ---- ACTIVITY LOG ---- */
-        .log-box {
+        .lang-selector select option {
             background: var(--bg-card);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            overflow: hidden;
+            color: var(--text-primary);
         }
-        .log-header {
-            background: linear-gradient(135deg, rgba(61,169,255,0.12), rgba(0,245,160,0.04));
-            padding: 0.9rem 1.2rem;
-            border-bottom: 1px solid var(--border);
-            display: flex; align-items: center; gap: 0.7rem;
+        .lang-selector i {
+            color: var(--automation-violet);
+            font-size: 0.9rem;
         }
-        .log-body { max-height: 320px; overflow-y: auto; padding: 0.5rem; }
-        .log-entry {
-            display: flex; align-items: flex-start; gap: 0.7rem;
-            padding: 0.7rem 0.9rem;
-            border-radius: 10px;
-            margin-bottom: 0.45rem;
-            border-left: 3px solid transparent;
-            transition: all 0.25s ease;
-            animation: slide-in 0.3s ease-out;
-        }
-        @keyframes slide-in { from { opacity: 0; transform: translateX(-16px); } to { opacity: 1; transform: none; } }
-        .log-entry:hover { transform: translateX(4px); }
-        .log-entry.success { border-color: var(--green);  background: rgba(0,245,160,0.07); }
-        .log-entry.warning { border-color: var(--amber);  background: rgba(255,176,32,0.07); }
-        .log-entry.error   { border-color: var(--red);    background: rgba(255,59,92,0.07); }
-        .log-entry.info    { border-color: var(--blue);   background: rgba(61,169,255,0.07); }
-
-        .log-icon {
-            width: 34px; height: 34px; border-radius: 9px;
-            display: flex; align-items: center; justify-content: center;
-            flex-shrink: 0; font-size: 0.85rem;
-        }
-        .log-icon.success { background: rgba(0,245,160,0.15); color: var(--green); }
-        .log-icon.warning { background: rgba(255,176,32,0.15); color: var(--amber); }
-        .log-icon.error   { background: rgba(255,59,92,0.15);  color: var(--red); }
-        .log-icon.info    { background: rgba(61,169,255,0.15); color: var(--blue); }
-
-        .log-text { font-size: 0.85rem; margin-bottom: 0.2rem; }
-        .log-time { font-size: 0.72rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
-
-        /* ---- TOAST ---- */
-        .toast-area { position: fixed; bottom: 18px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 0.65rem; }
-        .toast-msg {
-            background: rgba(15,23,36,0.98);
-            border: 1px solid var(--green-glow);
-            border-radius: 14px; padding: 0.9rem 1.1rem;
-            display: flex; align-items: center; gap: 0.7rem;
-            box-shadow: 0 8px 30px rgba(0,245,160,0.2);
-            min-width: 260px; font-weight: 600;
-            backdrop-filter: blur(10px);
-            animation: toast-in 0.35s ease-out;
-        }
-        @keyframes toast-in { from { transform: translateX(100%); opacity: 0; } to { transform: none; opacity: 1; } }
-        .toast-msg.success { border-left: 4px solid var(--green); }
-        .toast-msg.error   { border-left: 4px solid var(--red); }
-        .toast-msg.warning { border-left: 4px solid var(--amber); }
-
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: rgba(15,23,42,0.5); border-radius: 8px; }
-        ::-webkit-scrollbar-thumb { background: linear-gradient(180deg, var(--green), var(--green-dark)); border-radius: 8px; }
+        
+        .kpi-card { background: linear-gradient(145deg, var(--bg-glass-strong), var(--bg-card)); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 1.6rem; position: relative; overflow: hidden; height: 100%; backdrop-filter: var(--blur-glass); box-shadow: var(--shadow-sm), inset 0 0 30px rgba(0, 245, 160, 0.02); transition: var(--transition-smooth); cursor: pointer; }
+        .kpi-card::before { content: ""; position: absolute; top: 0; left: 0; width: 100%; height: 2px; background: linear-gradient(90deg, transparent 0%, var(--emerald-primary) 40%, var(--emerald-light) 50%, var(--emerald-primary) 60%, transparent 100%); transform: scaleX(0); transform-origin: left; transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1); }
+        .kpi-card:hover { transform: translateY(-8px) scale(1.02); border-color: rgba(0, 245, 160, 0.4); box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6), 0 0 30px rgba(0, 245, 160, 0.2); }
+        .kpi-card:hover::before { transform: scaleX(1); }
+        .kpi-card.alert { border-color: rgba(255, 59, 92, 0.3); animation: alertBorderPulse 2s ease-in-out infinite; }
+        .kpi-card.alert::before { background: linear-gradient(90deg, transparent 0%, var(--alert-red) 40%, #ff6b81 50%, var(--alert-red-dark) 60%, transparent 100%); }
+        .kpi-card.alert:hover { border-color: rgba(255, 59, 92, 0.6); box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6), 0 0 30px rgba(255, 59, 92, 0.3); }
+        @keyframes alertBorderPulse { 0%, 100% { border-color: rgba(255, 59, 92, 0.3); } 50% { border-color: rgba(255, 59, 92, 0.6); } }
+        .kpi-card.warning { border-color: rgba(255, 176, 32, 0.3); animation: warningBorderPulse 2s ease-in-out infinite; }
+        .kpi-card.warning::before { background: linear-gradient(90deg, transparent 0%, var(--warning-amber) 40%, #ffd166 50%, #ff9f1c 60%, transparent 100%); }
+        @keyframes warningBorderPulse { 0%, 100% { border-color: rgba(255, 176, 32, 0.3); } 50% { border-color: rgba(255, 176, 32, 0.6); } }
+        
+        .kpi-icon { width: 50px; height: 50px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 1.2rem; margin-bottom: 1.1rem; background: linear-gradient(145deg, rgba(0, 245, 160, 0.08), rgba(0, 245, 160, 0.03)); border: 1px solid rgba(0, 245, 160, 0.15); transition: var(--transition-smooth); }
+        .kpi-card:hover .kpi-icon { transform: scale(1.1) rotate(5deg); }
+        .kpi-icon.healthy { background: linear-gradient(145deg, rgba(0, 245, 160, 0.18), rgba(0, 245, 160, 0.06)); color: var(--status-online); border-color: rgba(0, 245, 160, 0.25); box-shadow: 0 0 15px rgba(0, 245, 160, 0.2); animation: healthyPulse 2s ease-in-out infinite; }
+        @keyframes healthyPulse { 0%, 100% { box-shadow: 0 0 15px rgba(0, 245, 160, 0.2); } 50% { box-shadow: 0 0 25px rgba(0, 245, 160, 0.4); } }
+        .kpi-icon.infected { background: linear-gradient(145deg, rgba(255, 59, 92, 0.22), rgba(255, 59, 92, 0.08)); color: var(--status-offline); border-color: rgba(255, 59, 92, 0.35); box-shadow: 0 0 15px rgba(255, 59, 92, 0.3); animation: infectedPulse 1.5s ease-in-out infinite; }
+        @keyframes infectedPulse { 0%, 100% { box-shadow: 0 0 15px rgba(255, 59, 92, 0.3); } 50% { box-shadow: 0 0 25px rgba(255, 59, 92, 0.5); } }
+        .kpi-icon.moisture { background: linear-gradient(145deg, rgba(61, 169, 255, 0.20), rgba(61, 169, 255, 0.07)); color: var(--status-processing); border-color: rgba(61, 169, 255, 0.30); }
+        .kpi-icon.temperature { background: linear-gradient(145deg, rgba(255, 176, 32, 0.22), rgba(255, 140, 0, 0.08)); color: var(--status-idle); border-color: rgba(255, 176, 32, 0.35); }
+        .kpi-icon.humidity { background: linear-gradient(145deg, rgba(6, 182, 212, 0.22), rgba(6, 182, 212, 0.08)); color: #22d3ee; border-color: rgba(6, 182, 212, 0.35); }
+        .kpi-icon.pump { background: linear-gradient(145deg, rgba(139, 92, 246, 0.22), rgba(124, 58, 237, 0.08)); color: #a78bfa; border-color: rgba(139, 92, 246, 0.35); }
+        .kpi-icon.spraying { animation: pumpSpin 1s linear infinite; background: linear-gradient(145deg, rgba(0, 245, 160, 0.3), rgba(0, 201, 127, 0.15)); color: var(--emerald-primary); border-color: var(--emerald-primary); }
+        @keyframes pumpSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        
+        .kpi-label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 1.4px; color: var(--text-secondary); opacity: 0.85; margin-bottom: 0.55rem; }
+        .kpi-value { font-size: 1.9rem; font-weight: 800; letter-spacing: 0.5px; margin-bottom: 0.3rem; line-height: 1.1; transition: all 0.3s ease; }
+        .kpi-value.healthy { color: var(--status-online); text-shadow: 0 0 12px rgba(0, 245, 160, 0.25); animation: valueGlow 2s ease-in-out infinite alternate; }
+        @keyframes valueGlow { from { text-shadow: 0 0 12px rgba(0, 245, 160, 0.25); } to { text-shadow: 0 0 20px rgba(0, 245, 160, 0.5); } }
+        .kpi-value.infected { color: var(--status-offline); text-shadow: 0 0 14px rgba(255, 59, 92, 0.35); animation: valueAlert 1s ease-in-out infinite alternate; }
+        @keyframes valueAlert { from { text-shadow: 0 0 14px rgba(255, 59, 92, 0.35); } to { text-shadow: 0 0 25px rgba(255, 59, 92, 0.6); } }
+        .kpi-value.warning { color: var(--status-idle); text-shadow: 0 0 14px rgba(255, 176, 32, 0.3); }
+        .kpi-value.info { color: var(--status-processing); text-shadow: 0 0 14px rgba(61, 169, 255, 0.3); }
+        .kpi-card:hover .kpi-value { transform: scale(1.05); }
+        .kpi-subtext { font-size: 0.85rem; font-weight: 500; color: var(--text-secondary); opacity: 0.8; transition: all 0.3s ease; }
+        .kpi-card:hover .kpi-subtext { opacity: 1; color: var(--text-primary); }
+        
+        .operation-panel { background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0.01)), var(--bg-card); border: 1px solid var(--border-color); border-radius: 20px; overflow: hidden; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25), inset 0 0 40px rgba(255, 255, 255, 0.02); transition: all 0.3s ease; }
+        .operation-panel:hover { transform: translateY(-4px); border-color: rgba(255, 255, 255, 0.12); box-shadow: 0 14px 50px rgba(0, 0, 0, 0.35); }
+        .panel-header { background: linear-gradient(135deg, rgba(16, 185, 129, 0.12), rgba(16, 185, 129, 0.03) 40%, transparent 70%); padding: 1.1rem 1.6rem; border-bottom: 1px solid var(--border-color); display: flex; align-items: center; gap: 0.8rem; position: relative; }
+        .panel-header::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--emerald-primary); box-shadow: 0 0 18px rgba(16, 185, 129, 0.35); }
+        .panel-header h5 { margin: 0; font-weight: 600; font-size: 1.05rem; color: var(--text-primary); }
+        
+        .live-feed-container { position: relative; background: radial-gradient(circle at center, rgba(0, 255, 180, 0.05), transparent 60%), #000; border-radius: 14px; overflow: hidden; aspect-ratio: 16 / 9; border: 1px solid rgba(255, 255, 255, 0.06); box-shadow: inset 0 0 40px rgba(0, 0, 0, 0.8), 0 8px 25px rgba(0, 0, 0, 0.35); transition: all 0.3s ease; }
+        .live-feed-container:hover { transform: translateY(-3px); border-color: rgba(0, 255, 180, 0.25); box-shadow: inset 0 0 50px rgba(0, 0, 0, 0.85), 0 14px 40px rgba(0, 0, 0, 0.45); }
+        .live-feed-container.infected { border: 3px solid var(--alert-red); box-shadow: 0 0 30px var(--alert-red-glow), 0 0 60px rgba(255, 59, 92, 0.25), inset 0 0 40px rgba(255, 59, 92, 0.15); animation: infectedFrame 1s ease-in-out infinite alternate; }
+        @keyframes infectedFrame { from { box-shadow: 0 0 30px var(--alert-red-glow), inset 0 0 40px rgba(255, 59, 92, 0.15); } to { box-shadow: 0 0 50px var(--alert-red-glow), inset 0 0 60px rgba(255, 59, 92, 0.25); } }
+        .live-feed-container.healthy { border: 3px solid var(--emerald-primary); box-shadow: 0 0 25px rgba(16, 185, 129, 0.25), inset 0 0 35px rgba(16, 185, 129, 0.08); animation: healthyFrame 2s ease-in-out infinite alternate; }
+        @keyframes healthyFrame { from { box-shadow: 0 0 25px rgba(16, 185, 129, 0.25); } to { box-shadow: 0 0 40px rgba(16, 185, 129, 0.4); } }
+        .live-feed-container.warning { border: 3px solid var(--warning-amber); box-shadow: 0 0 30px rgba(255, 176, 32, 0.35), inset 0 0 40px rgba(255, 176, 32, 0.12); animation: warningFrame 1.5s ease-in-out infinite alternate; }
+        @keyframes warningFrame { from { box-shadow: 0 0 30px rgba(255, 176, 32, 0.35); } to { box-shadow: 0 0 50px rgba(255, 176, 32, 0.5); } }
+        .live-badge { position: absolute; top: 12px; left: 12px; background: linear-gradient(135deg, var(--alert-red), rgba(255, 59, 92, 0.85)); color: #fff; padding: 0.3rem 0.8rem; border-radius: 6px; font-size: 0.7rem; font-weight: 700; letter-spacing: 1.2px; backdrop-filter: blur(6px); box-shadow: 0 0 18px rgba(255, 59, 92, 0.45); z-index: 10; animation: livePulse 1.5s ease-in-out infinite; }
+        @keyframes livePulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.8; transform: scale(1.05); } }
+        .detection-overlay { position: absolute; bottom: 12px; left: 12px; right: 12px; background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(12px) saturate(150%); border: 1px solid rgba(16, 185, 129, 0.3); padding: 0.75rem 1rem; border-radius: 10px; display: flex; align-items: center; gap: 0.75rem; box-shadow: 0 0 15px rgba(16, 185, 129, 0.25); z-index: 10; transition: all 0.3s ease; }
+        .detection-overlay.healthy { border-left: 4px solid var(--emerald-primary); box-shadow: 0 0 20px rgba(16, 185, 129, 0.4); }
+        .detection-overlay.infected { border-left: 4px solid var(--alert-red); box-shadow: 0 0 20px rgba(239, 68, 68, 0.4); }
+        .detection-overlay.warning { border-left: 4px solid var(--warning-amber); box-shadow: 0 0 20px rgba(245, 158, 11, 0.4); }
+        .detection-status { display: flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.5px; }
+        .detection-status.healthy { background: linear-gradient(90deg, var(--emerald-light), var(--emerald-primary)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .detection-status.infected { background: linear-gradient(90deg, #f87171, var(--alert-red)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: statusAlert 1s ease-in-out infinite alternate; }
+        @keyframes statusAlert { from { filter: brightness(1); } to { filter: brightness(1.3); } }
+        .detection-status.warning { background: linear-gradient(90deg, #fbbf24, var(--warning-amber)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .confidence-score { margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.875rem; color: var(--text-secondary); }
+        
+        .activity-log { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 16px; overflow: hidden; box-shadow: 0 8px 24px rgba(16, 185, 129, 0.15); }
+        .log-header { background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(16, 185, 129, 0.05)); padding: 1rem 1.25rem; border-bottom: 1px solid var(--border-color); display: flex; align-items: center; gap: 0.75rem; position: relative; }
+        .log-header::after { content: ''; position: absolute; bottom: 0; left: 0; width: 100%; height: 2px; background: linear-gradient(90deg, transparent, var(--info-blue), var(--emerald-light), transparent); animation: scanline 3s linear infinite; }
+        @keyframes scanline { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+        .log-entries { max-height: 350px; overflow-y: auto; padding: 0.5rem; }
+        .log-entry { display: flex; align-items: flex-start; gap: 0.75rem; padding: 0.75rem 1rem; border-radius: 10px; margin-bottom: 0.5rem; background: rgba(16, 185, 129, 0.05); animation: slideIn 0.4s ease-out; border-left: 3px solid transparent; transition: all 0.3s ease; }
+        .log-entry:hover { background: rgba(16, 185, 129, 0.12); box-shadow: 0 0 15px var(--emerald-glow); transform: translateX(5px); }
+        .log-entry.healthy { border-left-color: var(--emerald-primary); background: rgba(0, 245, 160, 0.08); }
+        .log-entry.infected { border-left-color: var(--alert-red); background: rgba(255, 59, 92, 0.08); }
+        .log-entry.warning { border-left-color: var(--warning-amber); background: rgba(255, 176, 32, 0.08); }
+        .log-entry.info { border-left-color: var(--info-blue); background: rgba(61, 169, 255, 0.08); }
+        @keyframes slideIn { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
+        .log-icon { width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.3s ease; }
+        .log-icon.success { background: rgba(16, 185, 129, 0.2); color: var(--emerald-primary); box-shadow: 0 0 10px var(--emerald-glow); }
+        .log-icon.warning { background: rgba(245, 158, 11, 0.2); color: var(--warning-amber); box-shadow: 0 0 10px var(--warning-glow); }
+        .log-icon.error { background: rgba(239, 68, 68, 0.2); color: var(--alert-red); box-shadow: 0 0 10px var(--alert-red-glow); }
+        .log-icon.info { background: rgba(59, 130, 246, 0.2); color: var(--info-blue); box-shadow: 0 0 10px var(--info-glow); }
+        .log-message { font-size: 0.875rem; color: var(--text-primary); margin-bottom: 0.25rem; }
+        .log-time { font-size: 0.75rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+        
+        .force-spray-btn { width: 100%; padding: 1rem 1.5rem; border: none; border-radius: 12px; background: var(--gradient-danger); color: white; font-weight: 700; font-size: 1rem; text-transform: uppercase; letter-spacing: 1px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 0.75rem; box-shadow: 0 0 15px rgba(239, 68, 68, 0.5); transition: all 0.3s ease; position: relative; overflow: hidden; animation: btnPulse 2s ease-in-out infinite; }
+        @keyframes btnPulse { 0%, 100% { box-shadow: 0 0 15px rgba(239, 68, 68, 0.5); } 50% { box-shadow: 0 0 30px rgba(239, 68, 68, 0.8); } }
+        .force-spray-btn::before { content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent); transition: left 0.5s; }
+        .force-spray-btn:hover::before { left: 100%; }
+        .force-spray-btn:hover:not(:disabled) { transform: translateY(-3px) scale(1.03); box-shadow: 0 0 35px rgba(239, 68, 68, 0.9); }
+        .force-spray-btn:disabled { opacity: 0.6; cursor: not-allowed; animation: none; }
+        .force-spray-btn.spraying { background: var(--gradient-primary); box-shadow: 0 0 25px rgba(16, 185, 129, 0.7); animation: sprayingPulse 0.5s ease-in-out infinite; }
+        @keyframes sprayingPulse { 0%, 100% { box-shadow: 0 0 25px rgba(16, 185, 129, 0.7); } 50% { box-shadow: 0 0 40px rgba(16, 185, 129, 0.9); } }
+        
+        .chart-container { background: rgba(30, 41, 59, 0.85); border: 1px solid var(--emerald-glow); border-radius: 20px; padding: 1.5rem; height: 380px; box-shadow: 0 4px 20px rgba(16, 185, 129, 0.25); backdrop-filter: blur(12px); position: relative; }
+        .chart-container::before { content: ''; position: absolute; top: -2px; left: -2px; width: calc(100% + 4px); height: calc(100% + 4px); border-radius: 20px; border: 2px solid transparent; background: linear-gradient(45deg, #10b981, #34d399, #059669, #10b981); background-size: 400% 400%; animation: neon-border 6s linear infinite; z-index: -1; }
+        @keyframes neon-border { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+        
+        .toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 0.75rem; }
+        .custom-toast { background: rgba(30, 41, 59, 0.98); border: 1px solid var(--emerald-glow); border-radius: 14px; padding: 1rem 1.25rem; display: flex; align-items: center; gap: 0.75rem; box-shadow: 0 10px 40px rgba(16, 185, 129, 0.3); animation: toastSlideIn 0.4s ease-out forwards; font-weight: 600; min-width: 280px; backdrop-filter: blur(10px); }
+        @keyframes toastSlideIn { 0% { transform: translateX(100%); opacity: 0; } 100% { transform: translateX(0); opacity: 1; } }
+        .custom-toast.success { border-left: 4px solid var(--emerald-primary); background: rgba(0, 245, 160, 0.1); }
+        .custom-toast.error { border-left: 4px solid var(--alert-red); background: rgba(255, 59, 92, 0.1); }
+        .custom-toast.warning { border-left: 4px solid var(--warning-amber); background: rgba(255, 176, 32, 0.1); }
+        .custom-toast.info { border-left: 4px solid var(--info-blue); background: rgba(61, 169, 255, 0.1); }
+        
+        ::-webkit-scrollbar { width: 10px; }
+        ::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.6); border-radius: 8px; }
+        ::-webkit-scrollbar-thumb { background: linear-gradient(180deg, var(--emerald-primary), var(--emerald-dark)); border-radius: 8px; box-shadow: 0 0 10px var(--emerald-primary); }
+        ::-webkit-scrollbar-thumb:hover { background: linear-gradient(180deg, var(--emerald-light), var(--emerald-primary)); box-shadow: 0 0 15px var(--emerald-primary); }
+        
+        .tech-overlay-backdrop { position: fixed; inset: 0; background: rgba(4, 8, 15, 0.95); backdrop-filter: var(--blur-strong); z-index: 1000; opacity: 0; visibility: hidden; transition: all 0.4s cubic-bezier(0.22, 1, 0.36, 1); display: flex; align-items: center; justify-content: center; padding: 2rem; }
+        .tech-overlay-backdrop.active { opacity: 1; visibility: visible; }
+        .tech-info-overlay { position: relative; width: 100%; max-width: 600px; max-height: 85vh; overflow-y: auto; background: linear-gradient(145deg, var(--bg-glass-strong), var(--bg-card)), radial-gradient(circle at 30% 20%, rgba(0, 245, 160, 0.08), transparent 50%); border: 1px solid var(--border-light); border-radius: var(--radius-lg); padding: 2rem; backdrop-filter: var(--blur-glass); box-shadow: var(--shadow-lg), 0 0 60px rgba(0, 245, 160, 0.15); transform: translateY(30px) scale(0.95); opacity: 0; transition: all 0.5s cubic-bezier(0.22, 1, 0.36, 1); }
+        .tech-overlay-backdrop.active .tech-info-overlay { transform: translateY(0) scale(1); opacity: 1; }
+        .tech-info-overlay::before { content: ""; position: absolute; inset: 0; border-radius: var(--radius-lg); padding: 2px; background: linear-gradient(135deg, var(--emerald-primary) 0%, var(--info-blue) 25%, var(--automation-violet) 50%, var(--info-blue) 75%, var(--emerald-primary) 100%); background-size: 300% 300%; -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0); -webkit-mask-composite: xor; mask-composite: exclude; animation: borderGlow 4s ease infinite; pointer-events: none; }
+        @keyframes borderGlow { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+        .tech-corner { position: absolute; width: 20px; height: 20px; border: 2px solid var(--emerald-primary); opacity: 0.6; pointer-events: none; }
+        .tech-corner-tl { top: 12px; left: 12px; border-right: none; border-bottom: none; }
+        .tech-corner-tr { top: 12px; right: 12px; border-left: none; border-bottom: none; }
+        .tech-corner-bl { bottom: 12px; left: 12px; border-right: none; border-top: none; }
+        .tech-corner-br { bottom: 12px; right: 12px; border-left: none; border-top: none; }
+        .tech-overlay-header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border-color); position: relative; }
+        .tech-overlay-icon { width: 56px; height: 56px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 1.4rem; background: linear-gradient(145deg, rgba(0, 245, 160, 0.15), rgba(0, 245, 160, 0.05)); border: 1px solid rgba(0, 245, 160, 0.25); animation: iconPulse 2s ease-in-out infinite; }
+        @keyframes iconPulse { 0%, 100% { box-shadow: inset 0 0 25px rgba(0, 245, 160, 0.1), 0 0 15px rgba(0, 245, 160, 0.2); } 50% { box-shadow: inset 0 0 35px rgba(0, 245, 160, 0.2), 0 0 25px rgba(0, 245, 160, 0.4); } }
+        .tech-overlay-close { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: rgba(255, 59, 92, 0.1); border: 1px solid rgba(255, 59, 92, 0.3); color: var(--alert-red); font-size: 1.1rem; cursor: pointer; transition: var(--transition-smooth); }
+        .tech-overlay-close:hover { background: rgba(255, 59, 92, 0.25); transform: rotate(90deg) scale(1.1); box-shadow: 0 0 20px rgba(255, 59, 92, 0.4); }
+        .tech-data-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; margin-bottom: 1.5rem; }
+        .tech-data-item { background: rgba(0, 245, 160, 0.05); border: 1px solid rgba(0, 245, 160, 0.1); border-radius: var(--radius-sm); padding: 1rem; transition: var(--transition-smooth); }
+        .tech-data-item:hover { background: rgba(0, 245, 160, 0.1); border-color: rgba(0, 245, 160, 0.25); transform: translateY(-3px); box-shadow: 0 5px 20px rgba(0, 245, 160, 0.15); }
+        .tech-data-label { font-size: 0.65rem; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.4rem; }
+        .tech-data-value { font-family: 'JetBrains Mono', monospace; font-size: 1.1rem; font-weight: 600; color: var(--text-primary); }
+        .tech-status-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.8rem; border-radius: 999px; font-size: 0.7rem; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; background: rgba(0, 245, 160, 0.1); border: 1px solid rgba(0, 245, 160, 0.25); color: var(--emerald-primary); }
+        .tech-status-badge::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--emerald-primary); animation: statusPulse 2s ease-in-out infinite; }
+        @keyframes statusPulse { 0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 8px var(--emerald-primary); } 50% { opacity: 0.7; transform: scale(1.3); box-shadow: 0 0 15px var(--emerald-primary); } }
+        .tech-timestamp { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--text-muted); }
+        .tech-progress-container { margin-bottom: 1rem; }
+        .tech-progress-label { display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+        .tech-progress-bar { height: 10px; background: rgba(255, 255, 255, 0.05); border-radius: 5px; overflow: hidden; position: relative; }
+        .tech-progress-fill { height: 100%; border-radius: 5px; transition: width 0.8s cubic-bezier(0.22, 1, 0.36, 1); position: relative; overflow: hidden; }
+        .tech-progress-fill::after { content: ""; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent); animation: shimmer 1.5s infinite; }
+        @keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+        .tech-progress-fill.success { background: var(--gradient-primary); box-shadow: 0 0 15px var(--emerald-glow); }
+        .tech-progress-fill.warning { background: var(--gradient-warning); box-shadow: 0 0 15px var(--warning-glow); }
+        .tech-progress-fill.danger { background: var(--gradient-danger); box-shadow: 0 0 15px var(--alert-red-glow); }
+        .stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin: 1rem 0; }
+        .stat-box { text-align: center; padding: 1rem; background: rgba(0, 245, 160, 0.05); border-radius: var(--radius-sm); border: 1px solid rgba(0, 245, 160, 0.1); transition: all 0.3s ease; }
+        .stat-box:hover { transform: translateY(-3px); background: rgba(0, 245, 160, 0.08); box-shadow: 0 5px 20px rgba(0, 245, 160, 0.15); }
+        .stat-value { font-family: 'JetBrains Mono', monospace; font-size: 1.5rem; font-weight: 700; color: var(--text-primary); transition: all 0.3s ease; }
+        .stat-box:hover .stat-value { transform: scale(1.1); }
+        .stat-label { font-size: 0.65rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-top: 0.25rem; }
+        
+        .spray-duration-panel { background: linear-gradient(145deg, var(--bg-glass-strong), var(--bg-card)); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 1.5rem; height: 100%; backdrop-filter: var(--blur-glass); box-shadow: var(--shadow-sm), inset 0 0 30px rgba(0, 245, 160, 0.02); transition: all 0.3s ease; }
+        .spray-duration-panel:hover { border-color: rgba(0, 245, 160, 0.3); box-shadow: 0 15px 40px rgba(0, 0, 0, 0.5), 0 0 25px rgba(0, 245, 160, 0.15); }
+        .duration-item { display: flex; align-items: center; justify-content: space-between; padding: 0.85rem 1rem; margin-bottom: 0.75rem; border-radius: var(--radius-sm); background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05); transition: all 0.3s ease; }
+        .duration-item:hover { transform: translateX(8px); background: rgba(255, 255, 255, 0.06); }
+        .duration-item.low { border-left: 4px solid var(--warning-amber); }
+        .duration-item.medium { border-left: 4px solid #f97316; }
+        .duration-item.high { border-left: 4px solid var(--alert-red); }
+        .duration-badge { padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .duration-badge.low { background: rgba(255, 176, 32, 0.25); color: var(--warning-amber); box-shadow: 0 0 10px rgba(255, 176, 32, 0.2); }
+        .duration-badge.medium { background: rgba(249, 115, 22, 0.25); color: #f97316; box-shadow: 0 0 10px rgba(249, 115, 22, 0.2); }
+        .duration-badge.high { background: rgba(255, 59, 92, 0.25); color: var(--alert-red); box-shadow: 0 0 10px rgba(255, 59, 92, 0.2); }
+        .duration-time { font-family: 'JetBrains Mono', monospace; font-size: 1.3rem; font-weight: 700; color: var(--text-primary); }
+        
+        .force-spray-section { background: linear-gradient(145deg, rgba(255, 59, 92, 0.1), rgba(255, 59, 92, 0.03)); border: 1px solid rgba(255, 59, 92, 0.25); border-radius: var(--radius-md); padding: 1.5rem; margin-bottom: 1.5rem; backdrop-filter: var(--blur-glass); transition: all 0.3s ease; animation: sectionPulse 3s ease-in-out infinite; }
+        @keyframes sectionPulse { 0%, 100% { border-color: rgba(255, 59, 92, 0.25); box-shadow: 0 0 20px rgba(255, 59, 92, 0.1); } 50% { border-color: rgba(255, 59, 92, 0.4); box-shadow: 0 0 30px rgba(255, 59, 92, 0.2); } }
+        .force-spray-section:hover { border-color: rgba(255, 59, 92, 0.5); box-shadow: 0 10px 40px rgba(255, 59, 92, 0.25); animation: none; }
+        
+        .loading-spinner { width: 24px; height: 24px; border: 3px solid rgba(16, 185, 129, 0.2); border-top-color: var(--emerald-light); border-radius: 50%; animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        
+        .data-updated { animation: dataFlash 0.5s ease-out; }
+        @keyframes dataFlash { 0% { background: rgba(0, 245, 160, 0.3); } 100% { background: transparent; } }
+        
+        @media (max-width: 768px) { .chart-container { height: 280px; } .stats-row { grid-template-columns: 1fr; } }
     </style>
+<base target="_blank">
 </head>
 <body>
-
-    <!-- Top header bar -->
-    <header class="top-bar">
+    <header class="mission-header">
         <div class="container">
             <div class="row align-items-center">
                 <div class="col-md-6">
                     <div class="d-flex align-items-center gap-3">
                         <i class="fas fa-leaf text-success fs-3"></i>
                         <div>
-                            <div class="site-title">Plant AI Monitor</div>
-                            <span class="system-badge">Intelligent Sprayer System Pro</span>
+                            <h1 class="project-title mb-0" data-i18n="project_title">Plant AI Monitor</h1>
+                            <span class="team-badge" data-i18n="team_badge">Intelligent Sprayer System Pro</span>
                         </div>
                     </div>
                 </div>
-                <div class="col-md-6 text-md-end mt-2 mt-md-0">
-                    <div class="d-flex align-items-center justify-content-md-end gap-2">
-                        <div class="online-dot" id="onlineDot"></div>
-                        <span id="statusLabel" style="font-size:0.85rem; color:var(--text-dim);">System Online</span>
+                <div class="col-md-6 text-md-end mt-3 mt-md-0">
+                    <div class="d-flex align-items-center justify-content-md-end flex-wrap gap-2">
+                        <!-- Weather Widget -->
+                        <div class="weather-widget" id="weatherWidget">
+                            <i class="fas fa-cloud-sun weather-icon" id="weatherIcon"></i>
+                            <div class="d-flex flex-column align-items-start">
+                                <span class="weather-city" id="weatherCity">Gunupur</span>
+                                <span><span class="weather-temp" id="weatherTemp">--</span>C <span class="weather-condition" id="weatherCondition">Fetching...</span></span>
+                            </div>
+                            <span class="rain-lock-badge d-none" id="rainLockBadge">RAIN LOCK</span>
+                        </div>
+                        <!-- Language Selector -->
+                        <div class="lang-selector">
+                            <i class="fas fa-globe"></i>
+                            <select id="languageSelect" onchange="changeLanguage(this.value)">
+                                <option value="en">English</option>
+                                <option value="hi">Hindi</option>
+                                <option value="or">Odia</option>
+                                <option value="ta">Tamil</option>
+                                <option value="te">Telugu</option>
+                            </select>
+                        </div>
+                        <div class="status-indicator" id="connectionStatus">
+                            <span id="statusDot" class="status-dot online"></span>
+                            <span id="statusText" data-i18n="system_online">System Online</span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -856,407 +757,1147 @@ def dashboard():
     </header>
 
     <main class="container py-4">
-
-        <!-- KPI cards row -->
+        <!-- KPI Cards -->
         <div class="row g-3 mb-4">
             <div class="col-6 col-md-4 col-lg-2">
-                <div class="kpi-card">
-                    <div class="kpi-icon green"><i class="fas fa-seedling"></i></div>
-                    <div class="kpi-label">Plant Status</div>
-                    <div class="kpi-value green" id="plantStatus">--</div>
-                    <div class="kpi-subtext" id="plantSub">Waiting...</div>
+                <div class="kpi-card" id="plantCard" onclick="openOverlay('plant')">
+                    <div class="kpi-icon healthy" id="plantIcon"><i class="fas fa-seedling"></i></div>
+                    <div class="kpi-label" data-i18n="plant_status">Plant Status</div>
+                    <div class="kpi-value healthy" id="plantStatus">--</div>
+                    <div class="kpi-subtext" id="plantSubtext" data-i18n="waiting_data">Waiting for data...</div>
                 </div>
             </div>
             <div class="col-6 col-md-4 col-lg-2">
-                <div class="kpi-card">
-                    <div class="kpi-icon blue"><i class="fas fa-brain"></i></div>
-                    <div class="kpi-label">AI Confidence</div>
-                    <div class="kpi-value blue" id="aiConf">--%</div>
-                    <div class="kpi-subtext">Neural Network</div>
+                <div class="kpi-card info" onclick="openOverlay('confidence')">
+                    <div class="kpi-icon moisture"><i class="fas fa-brain"></i></div>
+                    <div class="kpi-label" data-i18n="ai_confidence">AI Confidence</div>
+                    <div class="kpi-value info" id="confidenceValue">--%</div>
+                    <div class="kpi-subtext" data-i18n="neural_network">Neural Network</div>
                 </div>
             </div>
             <div class="col-6 col-md-4 col-lg-2">
-                <div class="kpi-card">
-                    <div class="kpi-icon blue"><i class="fas fa-tint"></i></div>
-                    <div class="kpi-label">Soil Moisture</div>
-                    <div class="kpi-value blue" id="moistureVal">--%</div>
-                    <div class="kpi-subtext" id="moistureSub">Waiting...</div>
+                <div class="kpi-card" id="moistureCard" onclick="openOverlay('moisture')">
+                    <div class="kpi-icon moisture"><i class="fas fa-tint"></i></div>
+                    <div class="kpi-label" data-i18n="soil_moisture">Soil Moisture</div>
+                    <div class="kpi-value info" id="moistureValue">--%</div>
+                    <div class="kpi-subtext" id="moistureStatus" data-i18n="waiting">Waiting...</div>
                 </div>
             </div>
             <div class="col-6 col-md-4 col-lg-2">
-                <div class="kpi-card">
-                    <div class="kpi-icon amber"><i class="fas fa-thermometer-half"></i></div>
-                    <div class="kpi-label">Temperature</div>
-                    <div class="kpi-value amber" id="tempVal">--°C</div>
-                    <div class="kpi-subtext">Ambient</div>
+                <div class="kpi-card" onclick="openOverlay('temperature')">
+                    <div class="kpi-icon temperature"><i class="fas fa-thermometer-half"></i></div>
+                    <div class="kpi-label" data-i18n="temperature">Temperature</div>
+                    <div class="kpi-value warning" id="tempValue">--C</div>
+                    <div class="kpi-subtext" data-i18n="ambient">Ambient</div>
                 </div>
             </div>
             <div class="col-6 col-md-4 col-lg-2">
-                <div class="kpi-card">
-                    <div class="kpi-icon cyan"><i class="fas fa-water"></i></div>
-                    <div class="kpi-label">Humidity</div>
-                    <div class="kpi-value blue" id="humidVal">--%</div>
-                    <div class="kpi-subtext">Air Moisture</div>
+                <div class="kpi-card info" onclick="openOverlay('humidity')">
+                    <div class="kpi-icon humidity"><i class="fas fa-water"></i></div>
+                    <div class="kpi-label" data-i18n="humidity">Humidity</div>
+                    <div class="kpi-value info" id="humidityValue">--%</div>
+                    <div class="kpi-subtext" data-i18n="air_moisture">Air Moisture</div>
                 </div>
             </div>
             <div class="col-6 col-md-4 col-lg-2">
-                <div class="kpi-card">
-                    <div class="kpi-icon violet"><i class="fas fa-cog" id="motorIcon"></i></div>
-                    <div class="kpi-label">Motor Status</div>
+                <div class="kpi-card" id="motorCard" onclick="openOverlay('motor')">
+                    <div class="kpi-icon pump" id="motorIconContainer"><i class="fas fa-cog" id="motorIcon"></i></div>
+                    <div class="kpi-label" data-i18n="motor_status">Motor Status</div>
                     <div class="kpi-value" id="motorStatus">IDLE</div>
-                    <div class="kpi-subtext" id="motorSub">Ready</div>
+                    <div class="kpi-subtext" id="motorSubtext" data-i18n="ready">Ready</div>
                 </div>
             </div>
         </div>
 
-        <!-- Force spray emergency button -->
-        <div class="force-spray-box">
+        <!-- FORCE SPRAY SECTION -->
+        <div class="force-spray-section">
             <div class="row align-items-center">
                 <div class="col-md-8">
                     <div class="d-flex align-items-center gap-3">
-                        <div class="kpi-icon red" style="margin-bottom:0;"><i class="fas fa-exclamation-triangle"></i></div>
+                        <div class="kpi-icon infected" style="margin-bottom: 0;"><i class="fas fa-exclamation-triangle"></i></div>
                         <div>
-                            <h5 style="color:var(--red); margin-bottom:0.3rem;">
-                                <i class="fas fa-spray-can me-2"></i>Manual Override
-                            </h5>
-                            <p class="mb-0 text-muted" style="font-size:0.85rem;">
-                                Emergency spray — triggers 3-second spray ignoring all conditions
-                            </p>
+                            <h5 class="mb-1" style="color: var(--alert-red); text-shadow: 0 0 10px rgba(255, 59, 92, 0.3);"><i class="fas fa-spray-can me-2"></i><span data-i18n="manual_override">Manual Override Control</span></h5>
+                            <p class="mb-0 text-muted small" data-i18n="emergency_desc">Emergency spray activation - Triggers 3-second spray regardless of conditions</p>
                         </div>
                     </div>
                 </div>
                 <div class="col-md-4 mt-3 mt-md-0">
-                    <button class="force-btn" id="forceBtn" onclick="triggerForceSpray()">
-                        <i class="fas fa-exclamation-triangle"></i> FORCE SPRAY
+                    <button class="force-spray-btn" id="forceSprayBtn" onclick="forceSpray()">
+                        <i class="fas fa-exclamation-triangle"></i><span data-i18n="force_spray">FORCE SPRAY</span>
                     </button>
                 </div>
             </div>
         </div>
 
-        <!-- Camera feed + spray duration side by side -->
+        <!-- LIVE CAMERA & AUTO-SPRAY DURATION ROW -->
         <div class="row g-4 mb-4">
             <div class="col-lg-8">
-                <div class="panel">
+                <div class="operation-panel">
                     <div class="panel-header">
-                        <i class="fas fa-video" style="color:var(--green);"></i>
-                        <h5>Live Camera Feed (HD 720p)</h5>
-                        <span class="badge bg-danger ms-auto">LIVE</span>
+                        <i class="fas fa-video"></i>
+                        <h5 data-i18n="live_camera">Live Camera Feed (HD 720p)</h5>
+                        <span class="badge bg-danger ms-auto animate-pulse">LIVE</span>
                     </div>
                     <div class="p-3">
-                        <div class="camera-box" id="cameraBox">
-                            <img id="videoFeed" src="/video_feed" alt="Live Camera Feed">
+                        <div class="live-feed-container" id="liveFeedContainer">
+                            <img id="videoFeed" src="/video_feed" class="w-100 h-100 object-fit-cover" alt="Live Feed" style="min-height: 300px;">
                             <span class="live-badge">LIVE</span>
-                            <div class="detection-bar" id="detectionBar">
-                                <div class="detection-label" id="detectionLabel">
-                                    <i class="fas fa-search me-1"></i> Analyzing...
-                                </div>
-                                <span class="detection-conf" id="detectionConf">--</span>
+                            <div class="detection-overlay" id="detectionOverlay">
+                                <div class="detection-status" id="detectionStatus"><i class="fas fa-search"></i><span data-i18n="analyzing">Analyzing...</span></div>
+                                <span class="confidence-score" id="confidenceScore">--</span>
                             </div>
                         </div>
                     </div>
                 </div>
             </div>
             <div class="col-lg-4">
-                <div class="duration-panel">
+                <div class="spray-duration-panel">
                     <div class="d-flex align-items-center gap-2 mb-3">
-                        <i class="fas fa-clock" style="color:var(--green);"></i>
-                        <h6 class="mb-0" style="font-weight:700; text-transform:uppercase; letter-spacing:1px;">
-                            Auto-Spray Durations
-                        </h6>
+                        <i class="fas fa-clock" style="color: var(--emerald-primary);"></i>
+                        <h6 class="mb-0" style="color: var(--text-primary); font-weight: 700; text-transform: uppercase; letter-spacing: 1px;" data-i18n="auto_spray_durations">Auto-Spray Durations</h6>
                     </div>
-                    <p class="text-muted mb-3" style="font-size:0.82rem;">
-                        Motor run time based on detected disease severity
-                    </p>
-                    <div class="duration-row low">
-                        <div class="d-flex align-items-center gap-2">
-                            <span class="sev-badge low">LOW</span>
-                            <span class="text-muted" style="font-size:0.8rem;">Mild infection</span>
-                        </div>
-                        <span class="sev-time" style="color:var(--amber);">2s</span>
+                    <p class="text-muted small mb-3" data-i18n="duration_desc">Automatic spray duration based on detected severity level</p>
+                    <div class="duration-item low">
+                        <div class="d-flex align-items-center gap-2"><span class="duration-badge low">LOW</span><span class="text-muted small" data-i18n="mild_detection">Mild Detection</span></div>
+                        <span class="duration-time" style="color: var(--warning-amber);">2s</span>
                     </div>
-                    <div class="duration-row medium">
-                        <div class="d-flex align-items-center gap-2">
-                            <span class="sev-badge medium">MED</span>
-                            <span class="text-muted" style="font-size:0.8rem;">Moderate infection</span>
-                        </div>
-                        <span class="sev-time" style="color:#f97316;">3s</span>
+                    <div class="duration-item medium">
+                        <div class="d-flex align-items-center gap-2"><span class="duration-badge medium">MED</span><span class="text-muted small" data-i18n="moderate_detection">Moderate Detection</span></div>
+                        <span class="duration-time" style="color: #f97316;">3s</span>
                     </div>
-                    <div class="duration-row high">
-                        <div class="d-flex align-items-center gap-2">
-                            <span class="sev-badge high">HIGH</span>
-                            <span class="text-muted" style="font-size:0.8rem;">Severe infection</span>
-                        </div>
-                        <span class="sev-time" style="color:var(--red);">5s</span>
+                    <div class="duration-item high">
+                        <div class="d-flex align-items-center gap-2"><span class="duration-badge high">HIGH</span><span class="text-muted small" data-i18n="severe_detection">Severe Detection</span></div>
+                        <span class="duration-time" style="color: var(--alert-red);">5s</span>
                     </div>
-                    <div class="mt-3 p-2 rounded" style="background:rgba(0,245,160,0.04); border:1px solid rgba(0,245,160,0.1);">
-                        <small style="color:var(--text-muted); font-size:0.75rem;">
-                            <i class="fas fa-info-circle me-1" style="color:var(--green);"></i>
-                            System adjusts spray time automatically based on AI confidence
-                        </small>
+                    <div class="mt-3 p-2 rounded" style="background: rgba(0, 245, 160, 0.05); border: 1px solid rgba(0, 245, 160, 0.1);">
+                        <small class="text-muted" style="font-size: 0.75rem;"><i class="fas fa-info-circle me-1" style="color: var(--emerald-primary);"></i><span data-i18n="system_adjusts">System automatically adjusts spray duration based on AI analysis confidence</span></small>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Moisture history chart -->
+        <!-- CENTER CHART SECTION -->
         <div class="row mb-4">
             <div class="col-12">
-                <div class="chart-box">
+                <div class="chart-container">
                     <div class="d-flex align-items-center justify-content-between mb-3">
-                        <h5 class="mb-0" style="font-weight:700;">
-                            <i class="fas fa-chart-area me-2" style="color:var(--green);"></i>
-                            Soil Moisture History
-                        </h5>
-                        <span class="text-muted" style="font-size:0.82rem;">Last 30 readings</span>
+                        <h5 class="mb-0" style="color: var(--text-primary); font-weight: 700;"><i class="fas fa-chart-area me-2" style="color: var(--emerald-primary);"></i><span data-i18n="moisture_history">Soil Moisture History Analysis</span></h5>
+                        <div class="d-flex gap-2">
+                            <span class="badge" style="background: rgba(0, 245, 160, 0.2); color: var(--emerald-primary);"><i class="fas fa-circle me-1" style="font-size: 0.5rem;"></i><span data-i18n="live_data">Live Data</span></span>
+                            <span class="text-muted small" data-i18n="last_30">Last 30 readings</span>
+                        </div>
                     </div>
                     <canvas id="moistureChart"></canvas>
                 </div>
             </div>
         </div>
 
-        <!-- Activity log -->
+        <!-- ACTIVITY LOG SECTION -->
         <div class="row">
             <div class="col-12">
-                <div class="log-box">
+                <div class="activity-log">
                     <div class="log-header">
-                        <i class="fas fa-terminal" style="color:var(--blue);"></i>
-                        <h6 class="mb-0" style="font-weight:600;">System Activity Log</h6>
+                        <i class="fas fa-terminal"></i>
+                        <h6 data-i18n="activity_log">System Activity Log</h6>
                         <span class="badge bg-secondary ms-auto" id="logCount">0</span>
                     </div>
-                    <div class="log-body" id="logBody">
-                        <div class="text-center text-muted py-4">
-                            <i class="fas fa-circle-notch fa-spin mb-2"></i>
-                            <p class="mb-0" style="font-size:0.85rem;">Loading logs...</p>
-                        </div>
+                    <div class="log-entries" id="logEntries">
+                        <div class="text-center text-muted py-4"><i class="fas fa-circle-notch fa-spin mb-2"></i><p class="small mb-0" data-i18n="loading_logs">Loading logs...</p></div>
                     </div>
                 </div>
             </div>
         </div>
-
     </main>
 
-    <div class="toast-area" id="toastArea"></div>
+    <div class="toast-container" id="toastContainer"></div>
+
+    <div class="tech-overlay-backdrop" id="techOverlay" onclick="closeOverlay(event)">
+        <div class="tech-info-overlay" id="overlayContent" onclick="event.stopPropagation()">
+            <div class="tech-corner tech-corner-tl"></div><div class="tech-corner tech-corner-tr"></div>
+            <div class="tech-corner tech-corner-bl"></div><div class="tech-corner tech-corner-br"></div>
+            <div class="tech-overlay-header">
+                <div class="tech-overlay-icon" id="overlayIcon"><i class="fas fa-leaf"></i></div>
+                <div class="tech-overlay-title-group">
+                    <div class="tech-overlay-title" id="overlayTitle" data-i18n="sensor_details">Sensor Details</div>
+                    <div class="tech-overlay-subtitle" id="overlaySubtitle" data-i18n="tech_diagnostics">Technical Diagnostics</div>
+                </div>
+                <button class="tech-overlay-close" onclick="closeOverlay()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="tech-overlay-content" id="overlayContentArea"></div>
+            <div class="tech-data-grid" id="overlayDataGrid">
+                <div class="tech-data-item"><div class="tech-data-label" data-i18n="last_reading">Last Reading</div><div class="tech-data-value" id="dataReading">--</div></div>
+                <div class="tech-data-item"><div class="tech-data-label" data-i18n="sensor_id">Sensor ID</div><div class="tech-data-value" id="dataSensor">--</div></div>
+                <div class="tech-data-item"><div class="tech-data-label" data-i18n="accuracy">Accuracy</div><div class="tech-data-value" id="dataAccuracy">--</div></div>
+                <div class="tech-data-item"><div class="tech-data-label" data-i18n="uptime">Uptime</div><div class="tech-data-value" id="dataUptime">--</div></div>
+            </div>
+            <div class="tech-overlay-footer">
+                <span class="tech-status-badge" id="overlayStatus" data-i18n="operational">Operational</span>
+                <span class="tech-timestamp" id="overlayTimestamp">--</span>
+            </div>
+        </div>
+    </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        // ---- Moisture Chart Setup ----
-        const chartCtx = document.getElementById('moistureChart').getContext('2d');
-        let moistureData = Array(30).fill(50);
-
-        const moistureChart = new Chart(chartCtx, {
-            type: 'line',
-            data: {
-                labels: moistureData.map((_, i) => `T-${30 - i}`),
-                datasets: [{
-                    label: 'Soil Moisture (%)',
-                    data: moistureData,
-                    borderColor: '#00f5a0',
-                    backgroundColor: 'rgba(0, 245, 160, 0.08)',
-                    borderWidth: 2,
-                    pointRadius: 2,
-                    fill: true,
-                    tension: 0.4
-                }]
+        // ===================== TRANSLATIONS DICTIONARY =====================
+        const translations = {
+            en: {
+                project_title: "Plant AI Monitor",
+                team_badge: "Intelligent Sprayer System Pro",
+                system_online: "System Online",
+                plant_status: "Plant Status",
+                ai_confidence: "AI Confidence",
+                soil_moisture: "Soil Moisture",
+                temperature: "Temperature",
+                humidity: "Humidity",
+                motor_status: "Motor Status",
+                waiting_data: "Waiting for data...",
+                neural_network: "Neural Network",
+                waiting: "Waiting...",
+                ambient: "Ambient",
+                air_moisture: "Air Moisture",
+                ready: "Ready",
+                manual_override: "Manual Override Control",
+                emergency_desc: "Emergency spray activation - Triggers 3-second spray regardless of conditions",
+                force_spray: "FORCE SPRAY",
+                live_camera: "Live Camera Feed (HD 720p)",
+                analyzing: "Analyzing...",
+                auto_spray_durations: "Auto-Spray Durations",
+                duration_desc: "Automatic spray duration based on detected severity level",
+                mild_detection: "Mild Detection",
+                moderate_detection: "Moderate Detection",
+                severe_detection: "Severe Detection",
+                system_adjusts: "System automatically adjusts spray duration based on AI analysis confidence",
+                moisture_history: "Soil Moisture History Analysis",
+                live_data: "Live Data",
+                last_30: "Last 30 readings",
+                activity_log: "System Activity Log",
+                loading_logs: "Loading logs...",
+                no_activity: "No activity yet",
+                sensor_details: "Sensor Details",
+                tech_diagnostics: "Technical Diagnostics",
+                last_reading: "Last Reading",
+                sensor_id: "Sensor ID",
+                accuracy: "Accuracy",
+                uptime: "Uptime",
+                operational: "Operational"
             },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: { legend: { labels: { color: '#9fb3c8' } } },
-                scales: {
-                    x: { ticks: { color: '#6b8098' }, grid: { color: 'rgba(255,255,255,0.04)' } },
-                    y: {
-                        min: 0, max: 100,
-                        ticks: { color: '#6b8098' },
-                        grid: { color: 'rgba(255,255,255,0.04)' }
-                    }
+            hi: {
+                project_title: "प्लांट एआई मॉनिटर",
+                team_badge: "इंटेलिजेंट स्प्रेयर सिस्टम प्रो",
+                system_online: "सिस्टम ऑनलाइन",
+                plant_status: "पौधे की स्थिति",
+                ai_confidence: "एआई विश्वास",
+                soil_moisture: "मिट्टी की नमी",
+                temperature: "तापमान",
+                humidity: "आर्द्रता",
+                motor_status: "मोटर स्थिति",
+                waiting_data: "डेटा की प्रतीक्षा...",
+                neural_network: "न्यूरल नेटवर्क",
+                waiting: "प्रतीक्षा...",
+                ambient: "वातावरण",
+                air_moisture: "हवा की नमी",
+                ready: "तैयार",
+                manual_override: "मैनुअल ओवरराइड नियंत्रण",
+                emergency_desc: "आपातकालीन स्प्रे सक्रियण - शर्तों की परवाह किए बिना 3-सेकंड का स्प्रे ट्रिगर करता है",
+                force_spray: "फोर्स स्प्रे",
+                live_camera: "लाइव कैमरा फीड (HD 720p)",
+                analyzing: "विश्लेषण कर रहा है...",
+                auto_spray_durations: "ऑटो-स्प्रे अवधि",
+                duration_desc: "patta लगाई गई गंभीरता के स्तर के आधार पर स्वचालित स्प्रे अवधि",
+                mild_detection: "हल्की patta",
+                moderate_detection: "मध्यम patta",
+                severe_detection: "गंभीर patta",
+                system_adjusts: "सिस्टम स्वचालित रूप से एआई विश्लेषण आत्मविश्वास के आधार पर स्प्रे अवधि को समायोजित करता है",
+                moisture_history: "मिट्टी की नमी इतिहास विश्लेषण",
+                live_data: "लाइव डेटा",
+                last_30: "अंतिम 30 रीडिंग",
+                activity_log: "सिस्टम गतिविधि लॉग",
+                loading_logs: "लॉग लोड हो रहे हैं...",
+                no_activity: "अभी तक कोई गतिविधि नहीं",
+                sensor_details: "सेंसर विवरण",
+                tech_diagnostics: "तकनीकी निदान",
+                last_reading: "अंतिम रीडिंग",
+                sensor_id: "सेंसर आईडी",
+                accuracy: "सटीकता",
+                uptime: "अपटाइम",
+                operational: "परिचालन"
+            },
+            or: {
+                project_title: "ଉଦ୍ଭିଦ AI ମନିଟର",
+                team_badge: "ବୁଦ୍ଧିମାନ ସ୍ପ୍ରେୟର ସିଷ୍ଟମ୍ ପ୍ରୋ",
+                system_online: "ସିଷ୍ଟମ୍ ଅନଲାଇନ୍",
+                plant_status: "ଉଦ୍ଭିଦ ସ୍ଥିତି",
+                ai_confidence: "AI ଆତ୍ମବିଶ୍ୱାସ",
+                soil_moisture: "ମାଟି ଆର୍ଦ୍ରତା",
+                temperature: "ତାପମାତ୍ରା",
+                humidity: "ଆର୍ଦ୍ରତା",
+                motor_status: "ମୋଟର ସ୍ଥିତି",
+                waiting_data: "ଡାଟା ଅପେକ୍ଷା...",
+                neural_network: "ନ୍ୟୁରାଲ ନେଟୱର୍କ",
+                waiting: "ଅପେକ୍ଷା...",
+                ambient: "ପରିବେଶ",
+                air_moisture: "ବାୟୁ ଆର୍ଦ୍ରତା",
+                ready: "ପ୍ରସ୍ତୁତ",
+                manual_override: "ମାନୁଆଲ୍ ଓଭରରାଇଡ୍ ନିୟନ୍ତ୍ରଣ",
+                emergency_desc: "ଜରୁରୀକାଳୀନ ସ୍ପ୍ରେ ସକ୍ରିୟକରଣ - ସର୍ତ୍ତାବଳୀ ବିନା 3-ସେକେଣ୍ଡ ସ୍ପ୍ରେ ଟ୍ରିଗର୍ କରେ",
+                force_spray: "ଫୋର୍ସ ସ୍ପ୍ରେ",
+                live_camera: "ଲାଇଭ୍ କ୍ୟାମେରା ଫିଡ୍ (HD 720p)",
+                analyzing: "ବିଶ୍ଳେଷଣ କରୁଛି...",
+                auto_spray_durations: "ଅଟୋ-ସ୍ପ୍ରେ ଅବଧି",
+                duration_desc: "ଚିହ୍ନଟ ହୋଇଥିବା ଗମ୍ଭୀରତା ସ୍ତର ଅନୁସାରେ ସ୍ୱୟଂଚାଳିତ ସ୍ପ୍ରେ ଅବଧି",
+                mild_detection: "ହାଲୁକା ଚିହ୍ନଟ",
+                moderate_detection: "ମଧ୍ୟମ ଚିହ୍ନଟ",
+                severe_detection: "ଗମ୍ଭୀର ଚିହ୍ନଟ",
+                system_adjusts: "ସିଷ୍ଟମ୍ AI ବିଶ୍ଳେଷଣ ଆତ୍ମବିଶ୍ୱାସ ଅନୁସାରେ ସ୍ୱୟଂଚାଳିତ ଭାବରେ ସ୍ପ୍ରେ ଅବଧି ସମାୟୋଜନ କରେ",
+                moisture_history: "ମାଟି ଆର୍ଦ୍ରତା ଇତିହାସ ବିଶ୍ଳେଷଣ",
+                live_data: "ଲାଇଭ୍ ଡାଟା",
+                last_30: "ଶେଷ 30 ରିଡିଂ",
+                activity_log: "ସିଷ୍ଟମ୍ କାର୍ଯ୍ୟକଳାପ ଲଗ୍",
+                loading_logs: "ଲଗ୍ ଲୋଡ୍ ହେଉଛି...",
+                no_activity: "ଏପର୍ଯ୍ୟନ୍ତ କୌଣସି କାର୍ଯ୍ୟକଳାପ ନାହିଁ",
+                sensor_details: "ସେନ୍ସର ବିବରଣୀ",
+                tech_diagnostics: "ପ୍ରଯୁକ୍ତିଗତ ନିଦାନ",
+                last_reading: "ଶେଷ ରିଡିଂ",
+                sensor_id: "ସେନ୍ସର ID",
+                accuracy: "ସଠିକତା",
+                uptime: "ଅପଟାଇମ୍",
+                operational: "ପରିଚାଳନା"
+            },
+            ta: {
+                project_title: "தாவர AI மானிட்டர்",
+                team_badge: "புத்திசாலி ஸ்ப்ரேயர் சிஸ்டம் ப்ரோ",
+                system_online: "சிஸ்டம் ஆன்லைன்",
+                plant_status: "தாவர நிலை",
+                ai_confidence: "AI நம்பிக்கை",
+                soil_moisture: "மண் ஈரப்பதம்",
+                temperature: "வெப்பநிலை",
+                humidity: "ஈரப்பதம்",
+                motor_status: "மோட்டார் நிலை",
+                waiting_data: "தரவுக்காகக் காத்திருக்கிறது...",
+                neural_network: "நியூரல் நெட்வொர்க்",
+                waiting: "காத்திருக்கிறது...",
+                ambient: "சுற்றுச்சூழல்",
+                air_moisture: "காற்று ஈரப்பதம்",
+                ready: "தயார்",
+                manual_override: "கையேடு மேலாண்மை கட்டுப்பாடு",
+                emergency_desc: "அவசர ஸ்ப்ரே செயல்படுத்தல் - நிபந்தனைகளைப் பொருட்படுத்தாமல் 3-வினாடி ஸ்ப்ரேயைத் தூண்டுகிறது",
+                force_spray: "ஃபோர்ஸ் ஸ்ப்ரே",
+                live_camera: "நேரடி கேமரா ஃபீட் (HD 720p)",
+                analyzing: "பகுப்பாய்வு செய்கிறது...",
+                auto_spray_durations: "ஆட்டோ-ஸ்ப்ரே காலம்",
+                duration_desc: "கண்டறியப்பட்ட தீவிரத்தின் அடிப்படையில் தானியங்கி ஸ்ப்ரே காலம்",
+                mild_detection: "லேசான கண்டறிதல்",
+                moderate_detection: "மிதமான கண்டறிதல்",
+                severe_detection: "கடுமையான கண்டறிதல்",
+                system_adjusts: "AI பகுப்பாய்வு நம்பிக்கையின் அடிப்படையில் சிஸ்டம் தானாகவே ஸ்ப்ரே காலத்தை சரிசெய்கிறது",
+                moisture_history: "மண் ஈரப்பதம் வரலாறு பகுப்பாய்வு",
+                live_data: "நேரடி தரவு",
+                last_30: "கடைசி 30 வாசிப்புகள்",
+                activity_log: "சிஸ்டம் செயல்பாடு பதிவு",
+                loading_logs: "பதிவுகள் ஏற்றப்படுகின்றன...",
+                no_activity: "இன்னும் செயல்பாடு இல்லை",
+                sensor_details: "சென்சார் விவரங்கள்",
+                tech_diagnostics: "தொழில்நுட்ப கண்டறிதல்",
+                last_reading: "கடைசி வாசிப்பு",
+                sensor_id: "சென்சார் ID",
+                accuracy: "துல்லியம்",
+                uptime: "இயக்க நேரம்",
+                operational: "செயல்பாட்டில்"
+            },
+            te: {
+                project_title: "మొక్క AI మానిటర్",
+                team_badge: "ఇంటెలిజెంట్ స్ప్రేయర్ సిస్టమ్ ప్రో",
+                system_online: "సిస్టమ్ ఆన్‌లైన్",
+                plant_status: "మొక్క స్థితి",
+                ai_confidence: "AI నమ్మకం",
+                soil_moisture: "నేల తేమ",
+                temperature: "ఉష్ణోగ్రత",
+                humidity: "తేమ",
+                motor_status: "మోటార్ స్థితి",
+                waiting_data: "డేటా కోసం వేచి ఉంది...",
+                neural_network: "న్యూరల్ నెట్‌వర్క్",
+                waiting: "వేచి ఉంది...",
+                ambient: "వాతావరణ",
+                air_moisture: "గాలి తేమ",
+                ready: "సిద్ధం",
+                manual_override: "మాన్యువల్ ఓవర్‌రైడ్ నియంత్రణ",
+                emergency_desc: "అత్యవసర స్ప్రే సక్రియం - పరిస్థితులను పట్టించుకోకుండా 3-సెకన్ల స్ప్రేను ట్రిగ్గర్ చేస్తుంది",
+                force_spray: "ఫోర్స్ స్ప్రే",
+                live_camera: "లైవ్ కెమెరా ఫీడ్ (HD 720p)",
+                analyzing: "విశ్లేషిస్తోంది...",
+                auto_spray_durations: "ఆటో-స్ప్రే వ్యవధులు",
+                duration_desc: "గుర్తించిన తీవ్రత స్థాయి ఆధారంగా ఆటోమేటిక్ స్ప్రే వ్యవధి",
+                mild_detection: "తేలికపాటి గుర్తింపు",
+                moderate_detection: "మధ్యస్థ గుర్తింపు",
+                severe_detection: "తీవ్రమైన గుర్తింపు",
+                system_adjusts: "AI విశ్లేషణ నమ్మకం ఆధారంగా సిస్టమ్ ఆటోమేటిక్‌గా స్ప్రే వ్యవధిని సర్దుబాటు చేస్తుంది",
+                moisture_history: "నేల తేమ చరిత్ర విశ్లేషణ",
+                live_data: "లైవ్ డేటా",
+                last_30: "చివరి 30 రీడింగ్‌లు",
+                activity_log: "సిస్టమ్ కార్యాచరణ లాగ్",
+                loading_logs: "లాగ్‌లు లోడ్ అవుతున్నాయి...",
+                no_activity: "ఇంకా ఏ కార్యాచరణ లేదు",
+                sensor_details: "సెన్సార్ వివరాలు",
+                tech_diagnostics: "సాంకేతిక నిర్ధారణ",
+                last_reading: "చివరి రీడింగ్",
+                sensor_id: "సెన్సార్ ID",
+                accuracy: "ఖచ్చితత్వం",
+                uptime: "అప్‌టైమ్",
+                operational: "నిర్వహణలో"
+            }
+        };
+
+        // ===================== LANGUAGE SWITCHER FUNCTION =====================
+        let currentLanguage = 'en';
+
+        function changeLanguage(lang) {
+            currentLanguage = lang;
+            const elements = document.querySelectorAll('[data-i18n]');
+            
+            elements.forEach(element => {
+                const key = element.getAttribute('data-i18n');
+                if (translations[lang] && translations[lang][key]) {
+                    element.textContent = translations[lang][key];
                 }
+            });
+            
+            // Store preference
+            localStorage.setItem('preferredLanguage', lang);
+        }
+
+        // Load saved language preference on page load
+        function loadLanguagePreference() {
+            const savedLang = localStorage.getItem('preferredLanguage');
+            if (savedLang && translations[savedLang]) {
+                document.getElementById('languageSelect').value = savedLang;
+                changeLanguage(savedLang);
+            }
+        }
+
+        // ===================== REAL DATA CONFIGURATION =====================
+        const API_BASE = '';
+        const SEVERITY_CLASSES = ['healthy', 'high', 'low', 'medium'];
+        const SPRAY_RUN_TIMES = { low: 2, medium: 3, high: 5 };
+        
+        let isSpraying = false;
+        let lastFetchTime = Date.now();
+        let isConnected = false;
+        let moistureHistory = Array(30).fill(50);
+        let lastMoisture = 50;
+        
+        let currentData = {
+            plant: 'Waiting...',
+            confidence: 0,
+            moisture: 0,
+            temperature: null,
+            humidity: null,
+            motor: 'OFF',
+            weather: { condition: 'Fetching...', temp: '--', city: 'Gunupur', rain_lock: false }
+        };
+
+        const overlayConfig = {
+            plant: { 
+                title: 'Plant Health Analysis', 
+                subtitle: 'AI-Powered Disease Detection', 
+                icon: 'fa-seedling', 
+                status: 'Analyzing', 
+                class: '', 
+                sensorId: 'CAM-001-AI', 
+                accuracy: '+-2.5%', 
+                uptime: '99.8%', 
+                renderContent: (data) => {
+                    const plantLabel = (data.plant || '').split(' ')[0].toLowerCase();
+                    const isHealthy = plantLabel === 'healthy';
+                    const severity = isHealthy ? 0 : (data.confidence || 0);
+                    return `
+                    <div class="stats-row">
+                        <div class="stat-box"><div class="stat-value" style="color: ${isHealthy ? 'var(--emerald-primary)' : 'var(--alert-red)'}">${isHealthy ? '100%' : severity.toFixed(1) + '%'}</div><div class="stat-label">Health Score</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--info-blue)">${data.confidence?.toFixed(1) || '0.0'}%</div><div class="stat-label">AI Confidence</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--warning-amber)">${data.detections || 0}</div><div class="stat-label">Detections</div></div>
+                    </div>
+                    <div class="tech-progress-container">
+                        <div class="tech-progress-label"><span>Disease Severity</span><span>${severity.toFixed(1)}%</span></div>
+                        <div class="tech-progress-bar"><div class="tech-progress-fill ${severity > 50 ? 'danger' : severity > 25 ? 'warning' : 'success'}" style="width: ${severity}%"></div></div>
+                    </div>
+                    <div style="background: ${isHealthy ? 'rgba(0,245,160,0.08)' : 'rgba(255,59,92,0.08)'}; padding: 1rem; border-radius: 10px; border: 1px solid ${isHealthy ? 'rgba(0,245,160,0.2)' : 'rgba(255,59,92,0.2)'}">
+                        <h6 style="color: ${isHealthy ? 'var(--emerald-primary)' : 'var(--alert-red)'}; margin-bottom: 0.75rem;"><i class="fas ${isHealthy ? 'fa-check-circle' : 'fa-exclamation-triangle'} me-2"></i>Diagnosis</h6>
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; margin: 0;">${isHealthy ? 'Plant appears healthy with no signs of disease. Continue regular monitoring and maintenance.' : `Detected <strong style="color: var(--alert-red)">${data.plant || 'Unknown Condition'}</strong>. Immediate treatment recommended.`}</p>
+                    </div>`;
+                }
+            },
+            confidence: { 
+                title: 'AI Model Performance', 
+                subtitle: 'Neural Network Diagnostics', 
+                icon: 'fa-brain', 
+                status: 'Processing', 
+                class: 'info', 
+                sensorId: 'AI-MODEL-v2.1', 
+                accuracy: '+-0.3%', 
+                uptime: '99.9%', 
+                renderContent: (data) => `
+                    <div class="stats-row">
+                        <div class="stat-box"><div class="stat-value" style="color: var(--info-blue)">${data.confidence?.toFixed(1) || '0.0'}%</div><div class="stat-label">Current Confidence</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--emerald-primary)">~120ms</div><div class="stat-label">Inference Time</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--automation-violet)">50K+</div><div class="stat-label">Training Images</div></div>
+                    </div>
+                    <div class="tech-progress-container">
+                        <div class="tech-progress-label"><span>Model Confidence</span><span>${data.confidence?.toFixed(1) || '0.0'}%</span></div>
+                        <div class="tech-progress-bar"><div class="tech-progress-fill ${data.confidence > 75 ? 'success' : data.confidence > 45 ? 'warning' : 'danger'}" style="width: ${data.confidence || 0}%"></div></div>
+                    </div>
+                    <div style="background: rgba(61,169,255,0.08); padding: 1rem; border-radius: 10px; border: 1px solid rgba(61,169,255,0.2)">
+                        <h6 style="color: var(--info-blue); margin-bottom: 0.75rem;"><i class="fas fa-microchip me-2"></i>Model Information</h6>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; font-size: 0.85rem;">
+                            <div><span style="color: var(--text-muted)">Architecture:</span> <span style="color: var(--text-primary)">MobileNetV2</span></div>
+                            <div><span style="color: var(--text-muted)">Binary Threshold:</span> <span style="color: var(--text-primary)">0.6</span></div>
+                            <div><span style="color: var(--text-muted)">Conf Threshold:</span> <span style="color: var(--text-primary)">45%</span></div>
+                            <div><span style="color: var(--text-muted)">Device:</span> <span style="color: var(--text-primary)">${navigator.gpu ? 'GPU' : 'CPU'}</span></div>
+                        </div>
+                    </div>`
+            },
+            moisture: { 
+                title: 'Soil Moisture Analysis', 
+                subtitle: 'Capacitive Sensor Array Data', 
+                icon: 'fa-tint', 
+                status: 'Monitoring', 
+                class: '', 
+                sensorId: 'MOIST-ARRAY-01', 
+                accuracy: '+-1.5%', 
+                uptime: '99.7%', 
+                renderContent: (data) => {
+                    const moisture = data.moisture || 0;
+                    const status = moisture < 30 ? 'danger' : moisture < 40 ? 'warning' : 'success';
+                    const statusColor = moisture < 30 ? 'var(--alert-red)' : moisture < 40 ? 'var(--warning-amber)' : 'var(--emerald-primary)';
+                    return `
+                    <div class="stats-row">
+                        <div class="stat-box"><div class="stat-value" style="color: ${statusColor}">${moisture.toFixed(1)}%</div><div class="stat-label">Current Level</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--info-blue)">${data.moistureAvg?.toFixed(1) || moisture.toFixed(1)}%</div><div class="stat-label">Session Average</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--warning-amber)">${data.moistureMin?.toFixed(1) || moisture.toFixed(1)}%</div><div class="stat-label">Session Minimum</div></div>
+                    </div>
+                    <div class="tech-progress-container">
+                        <div class="tech-progress-label"><span>Moisture Level</span><span>${moisture.toFixed(1)}%</span></div>
+                        <div class="tech-progress-bar"><div class="tech-progress-fill ${status}" style="width: ${moisture}%"></div></div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; margin: 1rem 0;">
+                        <div style="text-align: center; padding: 0.75rem; background: rgba(255,59,92,0.1); border-radius: 8px; border: 1px solid rgba(255,59,92,0.2)"><div style="font-size: 0.7rem; color: var(--alert-red); text-transform: uppercase;">Critical</div><div style="font-weight: 700; color: var(--text-primary);">&lt;30%</div></div>
+                        <div style="text-align: center; padding: 0.75rem; background: rgba(255,176,32,0.1); border-radius: 8px; border: 1px solid rgba(255,176,32,0.2)"><div style="font-size: 0.7rem; color: var(--warning-amber); text-transform: uppercase;">Warning</div><div style="font-weight: 700; color: var(--text-primary);">30-40%</div></div>
+                        <div style="text-align: center; padding: 0.75rem; background: rgba(0,245,160,0.1); border-radius: 8px; border: 1px solid rgba(0,245,160,0.2)"><div style="font-size: 0.7rem; color: var(--emerald-primary); text-transform: uppercase;">Optimal</div><div style="font-weight: 700; color: var(--text-primary);">40-70%</div></div>
+                    </div>
+                    <div style="background: ${moisture < 40 ? 'rgba(255,59,92,0.08)' : 'rgba(0,245,160,0.08)'}; padding: 1rem; border-radius: 10px; border: 1px solid ${moisture < 40 ? 'rgba(255,59,92,0.2)' : 'rgba(0,245,160,0.2)'}">
+                        <h6 style="color: ${moisture < 40 ? 'var(--alert-red)' : 'var(--emerald-primary)'}; margin-bottom: 0.5rem;"><i class="fas fa-info-circle me-2"></i>Recommendation</h6>
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; margin: 0;">${moisture < 30 ? 'Soil moisture is critically low. Auto-spray will trigger if plant detected.' : moisture < 40 ? 'Moisture levels are below optimal. Consider irrigation.' : moisture > 70 ? 'Soil is very wet. Ensure proper drainage.' : 'Moisture levels are optimal. Continue current schedule.'}</p>
+                    </div>`;
+                }
+            },
+            temperature: { 
+                title: 'Temperature Monitoring', 
+                subtitle: 'DHT22 Sensor Data', 
+                icon: 'fa-thermometer-half', 
+                status: 'Monitoring', 
+                class: 'warning', 
+                sensorId: 'TEMP-DHT22-01', 
+                accuracy: '+-0.5-C', 
+                uptime: '99.5%', 
+                renderContent: (data) => {
+                    const temp = data.temperature;
+                    const hasData = temp !== null && temp !== undefined;
+                    const status = !hasData ? 'neutral' : temp > 30 ? 'danger' : temp > 25 ? 'warning' : 'success';
+                    return `
+                    <div class="stats-row">
+                        <div class="stat-box"><div class="stat-value" style="color: ${status === 'danger' ? 'var(--alert-red)' : status === 'warning' ? 'var(--warning-amber)' : 'var(--emerald-primary)'}">${hasData ? temp.toFixed(1) + 'C' : '--'}</div><div class="stat-label">Current</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--info-blue)">${hasData ? (temp * 0.98).toFixed(1) + 'C' : '--'}</div><div class="stat-label">Session Avg</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--automation-violet)">${hasData ? (temp * 1.05).toFixed(1) + 'C' : '--'}</div><div class="stat-label">Session Max</div></div>
+                    </div>
+                    ${hasData ? `<div class="tech-progress-container"><div class="tech-progress-label"><span>Temperature Level</span><span>${temp.toFixed(1)}C</span></div><div class="tech-progress-bar"><div class="tech-progress-fill ${status}" style="width: ${Math.min((temp / 40) * 100, 100)}%"></div></div></div>` : ''}
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; margin: 1rem 0;">
+                        <div style="text-align: center; padding: 0.5rem; background: rgba(0,245,160,0.1); border-radius: 6px;"><div style="font-size: 0.65rem; color: var(--emerald-primary);">Optimal</div><div style="font-size: 0.8rem; font-weight: 600;">20-25C</div></div>
+                        <div style="text-align: center; padding: 0.5rem; background: rgba(255,176,32,0.1); border-radius: 6px;"><div style="font-size: 0.65rem; color: var(--warning-amber);">Warm</div><div style="font-size: 0.8rem; font-weight: 600;">25-30C</div></div>
+                        <div style="text-align: center; padding: 0.5rem; background: rgba(255,59,92,0.1); border-radius: 6px;"><div style="font-size: 0.65rem; color: var(--alert-red);">Hot</div><div style="font-size: 0.8rem; font-weight: 600;">30-35C</div></div>
+                        <div style="text-align: center; padding: 0.5rem; background: rgba(139,92,246,0.1); border-radius: 6px;"><div style="font-size: 0.65rem; color: var(--automation-violet);">Critical</div><div style="font-size: 0.8rem; font-weight: 600;">&gt;35C</div></div>
+                    </div>
+                    <div style="background: ${status === 'danger' ? 'rgba(255,59,92,0.08)' : 'rgba(0,245,160,0.08)'}; padding: 1rem; border-radius: 10px; border: 1px solid ${status === 'danger' ? 'rgba(255,59,92,0.2)' : 'rgba(0,245,160,0.2)'}">
+                        <h6 style="color: ${status === 'danger' ? 'var(--alert-red)' : 'var(--emerald-primary)'}; margin-bottom: 0.5rem;"><i class="fas ${status === 'danger' ? 'fa-exclamation-triangle' : 'fa-check-circle'} me-2"></i>${status === 'danger' ? 'High Temperature Alert' : 'Temperature Status'}</h6>
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; margin: 0;">${!hasData ? 'Waiting for sensor data...' : status === 'danger' ? 'Temperature is above optimal range. Consider increasing ventilation.' : status === 'warning' ? 'Temperature is slightly elevated. Monitor closely.' : 'Temperature is within optimal growing range.'}</p>
+                    </div>`;
+                }
+            },
+            humidity: { 
+                title: 'Humidity Analysis', 
+                subtitle: 'DHT22 Air Moisture Monitoring', 
+                icon: 'fa-water', 
+                status: 'Monitoring', 
+                class: 'info', 
+                sensorId: 'HUM-DHT22-01', 
+                accuracy: '+-2%', 
+                uptime: '99.5%', 
+                renderContent: (data) => {
+                    const humidity = data.humidity;
+                    const hasData = humidity !== null && humidity !== undefined;
+                    const status = !hasData ? 'neutral' : humidity < 30 ? 'warning' : humidity > 80 ? 'danger' : 'success';
+                    return `
+                    <div class="stats-row">
+                        <div class="stat-box"><div class="stat-value" style="color: #22d3ee">${hasData ? humidity.toFixed(1) + '%' : '--'}</div><div class="stat-label">Current</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--info-blue)">${hasData ? (humidity * 0.97).toFixed(1) + '%' : '--'}</div><div class="stat-label">Session Avg</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--automation-violet)">${data.humidityTrend || 'Stable'}</div><div class="stat-label">Trend</div></div>
+                    </div>
+                    ${hasData ? `<div class="tech-progress-container"><div class="tech-progress-label"><span>Relative Humidity</span><span>${humidity.toFixed(1)}%</span></div><div class="tech-progress-bar"><div class="tech-progress-fill ${status}" style="width: ${humidity}%; background: linear-gradient(90deg, #22d3ee, #3da9ff);"></div></div></div>` : ''}
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; margin: 1rem 0;">
+                        <div style="text-align: center; padding: 0.75rem; background: rgba(255,176,32,0.1); border-radius: 8px;"><div style="font-size: 0.7rem; color: var(--warning-amber); text-transform: uppercase;">Low</div><div style="font-weight: 700;">&lt;40%</div></div>
+                        <div style="text-align: center; padding: 0.75rem; background: rgba(0,245,160,0.1); border-radius: 8px;"><div style="font-size: 0.7rem; color: var(--emerald-primary); text-transform: uppercase;">Optimal</div><div style="font-weight: 700;">40-70%</div></div>
+                        <div style="text-align: center; padding: 0.75rem; background: rgba(255,59,92,0.1); border-radius: 8px;"><div style="font-size: 0.7rem; color: var(--alert-red); text-transform: uppercase;">High</div><div style="font-weight: 700;">&gt;70%</div></div>
+                    </div>
+                    <div style="background: rgba(6,182,212,0.08); padding: 1rem; border-radius: 10px; border: 1px solid rgba(6,182,212,0.2)">
+                        <h6 style="color: #22d3ee; margin-bottom: 0.5rem;"><i class="fas fa-cloud me-2"></i>Humidity Impact</h6>
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; margin: 0;">${!hasData ? 'Waiting for sensor data...' : humidity < 40 ? 'Low humidity may cause plant stress. Consider misting.' : humidity > 70 ? 'High humidity increases disease risk. Auto-spray disabled above 70%.' : 'Humidity levels are ideal for most plant growth.'}</p>
+                    </div>`;
+                }
+            },
+            motor: { 
+                title: 'Motor Control Panel', 
+                subtitle: 'Irrigation System Management', 
+                icon: 'fa-cog', 
+                status: 'Ready', 
+                class: '', 
+                sensorId: 'PUMP-DC-12V-01', 
+                accuracy: '+-0.1s', 
+                uptime: '98.2%', 
+                renderContent: (data) => `
+                    <div class="stats-row">
+                        <div class="stat-box"><div class="stat-value" style="color: ${data.motor === 'ON' ? 'var(--emerald-primary)' : 'var(--text-muted)'}">${data.motor || 'OFF'}</div><div class="stat-label">Current State</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--info-blue)">${data.sprayCount || 0}</div><div class="stat-label">Total Sprays</div></div>
+                        <div class="stat-box"><div class="stat-value" style="color: var(--warning-amber)">${data.lastSpray || 'Never'}</div><div class="stat-label">Last Spray</div></div>
+                    </div>
+                    <div class="tech-progress-container"><div class="tech-progress-label"><span>Motor Health</span><span>92%</span></div><div class="tech-progress-bar"><div class="tech-progress-fill success" style="width: 92%"></div></div></div>
+                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; margin: 1rem 0;">
+                        <button class="btn btn-success" onclick="forceSpray(); closeOverlay();" style="background: var(--gradient-primary); border: none; padding: 0.75rem; font-weight: 600;"><i class="fas fa-play me-2"></i>Start Spray</button>
+                        <button class="btn btn-outline-secondary" onclick="showToast('Calibration mode not implemented', 'info');" style="border-color: var(--border-color); color: var(--text-secondary);"><i class="fas fa-wrench me-2"></i>Calibrate</button>
+                    </div>
+                    <div style="background: rgba(139,92,246,0.08); padding: 1rem; border-radius: 10px; border: 1px solid rgba(139,92,246,0.2)">
+                        <h6 style="color: var(--automation-violet); margin-bottom: 0.75rem;"><i class="fas fa-cogs me-2"></i>System Parameters</h6>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; font-size: 0.85rem;">
+                            <div><span style="color: var(--text-muted)">Flow Rate:</span> <span style="color: var(--text-primary)">2.5 L/min</span></div>
+                            <div><span style="color: var(--text-muted)">Pressure:</span> <span style="color: var(--text-primary)">3.2 bar</span></div>
+                            <div><span style="color: var(--text-muted)">Nozzle Type:</span> <span style="color: var(--text-primary)">Fan Spray</span></div>
+                            <div><span style="color: var(--text-muted)">Tank Level:</span> <span style="color: var(--text-primary)">~78%</span></div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 1rem;">
+                        <h6 style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;"><i class="fas fa-history me-1"></i>Spray History</h6>
+                        <div style="max-height: 120px; overflow-y: auto;">${(data.sprayHistory || []).length > 0 ? data.sprayHistory.map(h => `<div style="display: flex; justify-content: space-between; padding: 0.4rem 0; border-bottom: 1px solid var(--border-color); font-size: 0.8rem;"><span style="color: var(--text-secondary)">${h.time}</span><span style="color: ${h.trigger === 'Manual' ? 'var(--warning-amber)' : 'var(--emerald-primary)'}">${h.trigger} (${h.duration}s)</span></div>`).join('') : '<div style="color: var(--text-muted); font-size: 0.8rem; text-align: center; padding: 0.5rem;">No sprays recorded yet</div>'}</div>
+                    </div>`
+            }
+        };
+
+        const ctxChart = document.getElementById('moistureChart').getContext('2d');
+        const moistureChart = new Chart(ctxChart, {
+            type: 'line',
+            data: { 
+                labels: Array(30).fill('').map((_, i) => `-${30-i}s`), 
+                datasets: [{ 
+                    label: 'Moisture %', 
+                    data: moistureHistory, 
+                    borderColor: '#3b82f6', 
+                    backgroundColor: (context) => {
+                        const ctx = context.chart.ctx;
+                        const gradient = ctx.createLinearGradient(0, 0, 0, 300);
+                        gradient.addColorStop(0, 'rgba(59, 130, 246, 0.3)');
+                        gradient.addColorStop(1, 'rgba(59, 130, 246, 0.05)');
+                        return gradient;
+                    },
+                    fill: true, 
+                    tension: 0.4, 
+                    pointRadius: 4, 
+                    pointBackgroundColor: '#3b82f6', 
+                    pointBorderColor: '#fff', 
+                    pointBorderWidth: 2, 
+                    borderWidth: 3 
+                }] 
+            },
+            options: { 
+                responsive: true, 
+                maintainAspectRatio: false, 
+                plugins: { 
+                    legend: { display: false }, 
+                    tooltip: { 
+                        backgroundColor: 'rgba(15, 23, 36, 0.95)', 
+                        titleColor: '#00f5a0', 
+                        bodyColor: '#e6edf6', 
+                        borderColor: 'rgba(0, 245, 160, 0.3)', 
+                        borderWidth: 1, 
+                        padding: 12, 
+                        displayColors: false 
+                    } 
+                }, 
+                scales: { 
+                    x: { 
+                        display: true, 
+                        grid: { color: 'rgba(255, 255, 255, 0.03)' }, 
+                        ticks: { color: '#6b8098', font: { size: 9 }, maxTicksLimit: 6 } 
+                    }, 
+                    y: { 
+                        min: 0, 
+                        max: 100, 
+                        grid: { color: 'rgba(255, 255, 255, 0.05)' }, 
+                        ticks: { 
+                            color: '#94a3b8', 
+                            font: { size: 11 }, 
+                            callback: function(value) { return value + '%'; } 
+                        } 
+                    } 
+                }, 
+                animation: { duration: 300 } 
             }
         });
 
-        // ---- Push a toast notification ----
-        function showToast(message, type = 'success') {
-            const area = document.getElementById('toastArea');
-            const icons = { success: 'fa-check-circle', error: 'fa-times-circle', warning: 'fa-exclamation-triangle' };
-            const colors = { success: '#00f5a0', error: '#ff3b5c', warning: '#ffb020' };
-
-            const toast = document.createElement('div');
-            toast.className = `toast-msg ${type}`;
-            toast.innerHTML = `
-                <i class="fas ${icons[type] || 'fa-info-circle'}" style="color:${colors[type]};"></i>
-                <span>${message}</span>`;
-            area.appendChild(toast);
-
-            setTimeout(() => toast.remove(), 3500);
+        async function fetchStatus() {
+            try {
+                const response = await fetch('/status');
+                if (!response.ok) throw new Error('Status API error');
+                const data = await response.json();
+                
+                isConnected = true;
+                lastFetchTime = Date.now();
+                updateConnectionStatus(true);
+                
+                currentData = {
+                    ...currentData,
+                    plant: data.plant || 'No Plant',
+                    confidence: data.confidence || 0,
+                    moisture: data.moisture || 0,
+                    temperature: data.temperature,
+                    humidity: data.humidity,
+                    motor: data.motor || 'OFF',
+                    weather: data.weather || { condition: 'Fetching...', temp: '--', city: 'Gunupur', rain_lock: false }
+                };
+                
+                updateUI(currentData);
+                updateWeatherWidget(currentData.weather);
+                
+            } catch (error) {
+                console.error('Error fetching status:', error);
+                isConnected = false;
+                updateConnectionStatus(false);
+            }
         }
 
-        // ---- Force spray button ----
-        async function triggerForceSpray() {
-            const btn = document.getElementById('forceBtn');
-            btn.disabled = true;
-            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Spraying...';
-
-            try {
-                const res = await fetch('/force_spray', { method: 'POST' });
-                const data = await res.json();
-                showToast('Force spray activated — 3s spray queued!', 'warning');
-            } catch (err) {
-                showToast('Failed to trigger spray', 'error');
+        function updateWeatherWidget(weather) {
+            const widget = document.getElementById('weatherWidget');
+            const icon = document.getElementById('weatherIcon');
+            const temp = document.getElementById('weatherTemp');
+            const condition = document.getElementById('weatherCondition');
+            const city = document.getElementById('weatherCity');
+            const badge = document.getElementById('rainLockBadge');
+            
+            temp.textContent = weather.temp;
+            condition.textContent = weather.condition;
+            city.textContent = weather.city;
+            
+            const conditionLower = weather.condition.toLowerCase();
+            if (conditionLower.includes('rain') || conditionLower.includes('drizzle') || conditionLower.includes('shower')) {
+                icon.className = 'fas fa-cloud-rain weather-icon';
+            } else if (conditionLower.includes('sun') || conditionLower.includes('clear')) {
+                icon.className = 'fas fa-sun weather-icon';
+            } else if (conditionLower.includes('cloud')) {
+                icon.className = 'fas fa-cloud weather-icon';
+            } else if (conditionLower.includes('storm')) {
+                icon.className = 'fas fa-bolt weather-icon';
+            } else {
+                icon.className = 'fas fa-cloud-sun weather-icon';
             }
+            
+            if (weather.rain_lock) {
+                widget.classList.add('rain-lock');
+                badge.classList.remove('d-none');
+                condition.innerHTML = weather.condition + ' <span style="color: var(--alert-red); font-weight: 700;">(RAIN LOCK ACTIVE)</span>';
+            } else {
+                widget.classList.remove('rain-lock');
+                badge.classList.add('d-none');
+            }
+        }
 
+        async function fetchLogs() {
+            try {
+                const response = await fetch('/logs');
+                if (!response.ok) throw new Error('Logs API error');
+                const logs = await response.json();
+                renderLogs(logs);
+            } catch (error) {
+                console.error('Error fetching logs:', error);
+            }
+        }
+
+        async function sendForceSpray() {
+            try {
+                const response = await fetch('/force_spray', { method: 'POST' });
+                if (!response.ok) throw new Error('Force spray API error');
+                const data = await response.json();
+                showToast('Force spray activated!', 'success');
+                return true;
+            } catch (error) {
+                console.error('Error sending force spray:', error);
+                showToast('Failed to activate spray', 'error');
+                return false;
+            }
+        }
+
+        function updateUI(data) {
+            const plantCard = document.getElementById('plantCard');
+            const plantIcon = document.getElementById('plantIcon');
+            const plantStatus = document.getElementById('plantStatus');
+            const plantSubtext = document.getElementById('plantSubtext');
+            const liveFeedContainer = document.getElementById('liveFeedContainer');
+            const detectionOverlay = document.getElementById('detectionOverlay');
+            const detectionStatus = document.getElementById('detectionStatus');
+            const confidenceScore = document.getElementById('confidenceScore');
+            
+            const plantLabel = (data.plant || '').split(' ')[0].toLowerCase();
+            
+            plantCard.classList.remove('alert', 'warning');
+            plantIcon.className = 'kpi-icon';
+            plantStatus.className = 'kpi-value';
+            liveFeedContainer.className = 'live-feed-container';
+            detectionOverlay.className = 'detection-overlay';
+            detectionStatus.className = 'detection-status';
+            
+            if (plantLabel === 'high') {
+                plantCard.classList.add('alert');
+                plantIcon.classList.add('infected');
+                plantIcon.innerHTML = '<i class="fas fa-exclamation-triangle"></i>';
+                plantStatus.classList.add('infected');
+                plantStatus.textContent = 'HIGH';
+                plantSubtext.textContent = 'Critical severity!';
+                liveFeedContainer.classList.add('infected');
+                detectionOverlay.classList.add('infected');
+                detectionStatus.innerHTML = '<i class="fas fa-biohazard"></i><span>High Severity</span>';
+                detectionStatus.classList.add('infected');
+            } else if (plantLabel === 'medium') {
+                plantCard.classList.add('warning');
+                plantIcon.classList.add('infected');
+                plantIcon.innerHTML = '<i class="fas fa-exclamation-circle"></i>';
+                plantStatus.classList.add('warning');
+                plantStatus.textContent = 'MEDIUM';
+                plantSubtext.textContent = 'Moderate severity';
+                liveFeedContainer.classList.add('warning');
+                detectionOverlay.classList.add('warning');
+                detectionStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i><span>Medium Severity</span>';
+                detectionStatus.classList.add('warning');
+            } else if (plantLabel === 'low') {
+                plantCard.classList.add('warning');
+                plantIcon.classList.add('infected');
+                plantIcon.innerHTML = '<i class="fas fa-bug"></i>';
+                plantStatus.classList.add('warning');
+                plantStatus.textContent = 'LOW';
+                plantSubtext.textContent = 'Low severity';
+                liveFeedContainer.classList.add('warning');
+                detectionOverlay.classList.add('warning');
+                detectionStatus.innerHTML = '<i class="fas fa-bug"></i><span>Low Severity</span>';
+                detectionStatus.classList.add('warning');
+            } else if (plantLabel === 'healthy') {
+                plantIcon.classList.add('healthy');
+                plantIcon.innerHTML = '<i class="fas fa-check-circle"></i>';
+                plantStatus.classList.add('healthy');
+                plantStatus.textContent = 'HEALTHY';
+                plantSubtext.textContent = 'Plant is healthy';
+                liveFeedContainer.classList.add('healthy');
+                detectionOverlay.classList.add('healthy');
+                detectionStatus.innerHTML = '<i class="fas fa-shield-alt"></i><span>Plant Healthy</span>';
+                detectionStatus.classList.add('healthy');
+            } else {
+                plantIcon.innerHTML = '<i class="fas fa-search"></i>';
+                plantStatus.textContent = 'NO PLANT';
+                plantSubtext.textContent = 'No plant detected';
+                detectionStatus.innerHTML = '<i class="fas fa-search"></i><span>No Plant</span>';
+            }
+            
+            confidenceScore.textContent = `Confidence: ${(data.confidence || 0).toFixed(1)}%`;
+            
+            document.getElementById('confidenceValue').textContent = `${(data.confidence || 0).toFixed(1)}%`;
+            document.getElementById('moistureValue').textContent = `${(data.moisture || 0).toFixed(1)}%`;
+            document.getElementById('tempValue').textContent = data.temperature !== null ? `${data.temperature.toFixed(1)}C` : '--C';
+            document.getElementById('humidityValue').textContent = data.humidity !== null ? `${data.humidity.toFixed(1)}%` : '--%';
+            
+            const moistureCard = document.getElementById('moistureCard');
+            const moistureStatus = document.getElementById('moistureStatus');
+            moistureCard.classList.remove('alert', 'warning');
+            if (data.moisture < 30) { 
+                moistureCard.classList.add('alert'); 
+                moistureStatus.textContent = 'Critical - Low!'; 
+            } else if (data.moisture < 40) { 
+                moistureCard.classList.add('warning'); 
+                moistureStatus.textContent = 'Warning - Low'; 
+            } else { 
+                moistureStatus.textContent = 'Optimal level'; 
+            }
+            
+            const motorCard = document.getElementById('motorCard');
+            const motorIconContainer = document.getElementById('motorIconContainer');
+            const motorStatus = document.getElementById('motorStatus');
+            const motorSubtext = document.getElementById('motorSubtext');
+            
+            if (data.motor === 'ON') {
+                motorCard.classList.add('alert');
+                motorIconContainer.classList.add('spraying');
+                motorStatus.textContent = 'SPRAYING';
+                motorStatus.style.color = 'var(--emerald-primary)';
+                motorSubtext.textContent = 'Pesticide dispensing...';
+            } else {
+                motorCard.classList.remove('alert');
+                motorIconContainer.classList.remove('spraying');
+                motorStatus.textContent = 'IDLE';
+                motorStatus.style.color = 'var(--text-primary)';
+                motorSubtext.textContent = 'Ready to spray';
+            }
+            
+            if (data.moisture !== lastMoisture) {
+                moistureHistory.push(data.moisture);
+                moistureHistory.shift();
+                moistureChart.data.datasets[0].data = moistureHistory;
+                moistureChart.update('none');
+                lastMoisture = data.moisture;
+            }
+        }
+
+        function updateConnectionStatus(isOnline) {
+            const statusDot = document.getElementById('statusDot');
+            const statusText = document.getElementById('statusText');
+            const connectionStatus = document.getElementById('connectionStatus');
+            
+            if (isOnline) {
+                statusDot.classList.remove('offline');
+                statusDot.classList.add('online');
+                statusText.textContent = translations[currentLanguage]?.system_online || 'System Online';
+                connectionStatus.style.borderColor = 'rgba(0, 245, 160, 0.2)';
+            } else {
+                statusDot.classList.remove('online');
+                statusDot.classList.add('offline');
+                statusText.textContent = 'System Offline';
+                connectionStatus.style.borderColor = 'rgba(255, 59, 92, 0.3)';
+            }
+        }
+
+        function renderLogs(logs) {
+            const container = document.getElementById('logEntries');
+            document.getElementById('logCount').textContent = logs.length;
+            
+            if (logs.length === 0) {
+                container.innerHTML = `<div class="text-center text-muted py-4"><i class="fas fa-inbox mb-2"></i><p class="small mb-0" data-i18n="no_activity">${translations[currentLanguage]?.no_activity || 'No activity yet'}</p></div>`;
+                return;
+            }
+            
+            const iconMap = {
+                'success': 'fa-check-circle',
+                'info': 'fa-info-circle',
+                'warning': 'fa-exclamation-triangle',
+                'error': 'fa-times-circle'
+            };
+            
+            container.innerHTML = logs.slice().reverse().map(log => `
+                <div class="log-entry ${log.type}">
+                    <div class="log-icon ${log.type}"><i class="fas ${iconMap[log.type] || 'fa-info-circle'}"></i></div>
+                    <div><div class="log-message">${log.message}</div><div class="log-time">${log.time}</div></div>
+                </div>
+            `).join('');
+        }
+
+        function openOverlay(type) {
+            const config = overlayConfig[type];
+            if (!config) return;
+            
+            const overlay = document.getElementById('techOverlay');
+            const content = document.getElementById('overlayContent');
+            
+            document.getElementById('overlayTitle').textContent = config.title;
+            document.getElementById('overlaySubtitle').textContent = config.subtitle;
+            document.getElementById('overlayIcon').innerHTML = `<i class="fas ${config.icon}"></i>`;
+            document.getElementById('overlayStatus').textContent = config.status;
+            document.getElementById('dataSensor').textContent = config.sensorId;
+            document.getElementById('dataAccuracy').textContent = config.accuracy;
+            document.getElementById('dataUptime').textContent = config.uptime;
+            document.getElementById('dataReading').textContent = new Date().toLocaleTimeString();
+            
+            const now = new Date();
+            document.getElementById('overlayTimestamp').textContent = now.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+            
+            content.className = 'tech-info-overlay';
+            if (config.class) content.classList.add(config.class);
+            
+            document.getElementById('overlayContentArea').innerHTML = config.renderContent(currentData);
+            
+            overlay.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeOverlay(event) {
+            if (event && event.target !== event.currentTarget && event.type === 'click') return;
+            document.getElementById('techOverlay').classList.remove('active');
+            document.body.style.overflow = '';
+        }
+
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `custom-toast ${type}`;
+            const icons = { success: 'fa-check-circle', error: 'fa-times-circle', warning: 'fa-exclamation-triangle', info: 'fa-info-circle' };
+            const colors = { success: 'var(--emerald-primary)', error: 'var(--alert-red)', warning: 'var(--warning-amber)', info: 'var(--info-blue)' };
+            toast.innerHTML = `<i class="fas ${icons[type]}" style="color: ${colors[type]}"></i><span>${message}</span>`;
+            container.appendChild(toast);
+            
             setTimeout(() => {
-                btn.disabled = false;
-                btn.innerHTML = '<i class="fas fa-exclamation-triangle"></i> FORCE SPRAY';
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateX(100%)';
+                setTimeout(() => toast.remove(), 300);
             }, 4000);
         }
 
-        // ---- Poll status and update all KPI cards ----
-        async function refreshStatus() {
-            try {
-                const res = await fetch('/status');
-                const d = await res.json();
-
-                // Plant status card
-                const plantLabel = (d.plant || '').split(' ')[0].toLowerCase();
-                document.getElementById('plantStatus').textContent = plantLabel || '--';
-                document.getElementById('plantSub').textContent = `${(d.confidence || 0).toFixed(1)}% confidence`;
-
-                // AI confidence
-                document.getElementById('aiConf').textContent = `${(d.confidence || 0).toFixed(1)}%`;
-
-                // Moisture
-                const moisture = d.moisture ?? 0;
-                document.getElementById('moistureVal').textContent = `${moisture.toFixed(1)}%`;
-                document.getElementById('moistureSub').textContent = moisture < 40 ? 'Low — needs water' : 'OK';
-
-                // Moisture chart update
-                moistureData.push(moisture);
-                if (moistureData.length > 30) moistureData.shift();
-                moistureChart.data.datasets[0].data = [...moistureData];
-                moistureChart.update('none');
-
-                // Temperature
-                const temp = d.temperature;
-                document.getElementById('tempVal').textContent = temp !== null ? `${temp}°C` : '--°C';
-
-                // Humidity
-                const hum = d.humidity;
-                document.getElementById('humidVal').textContent = hum !== null ? `${hum}%` : '--%';
-
-                // Motor status
-                const motorEl = document.getElementById('motorStatus');
-                const motorSub = document.getElementById('motorSub');
-                const motorIcon = document.getElementById('motorIcon');
-                if (d.motor === 'ON') {
-                    motorEl.textContent = 'ACTIVE';
-                    motorEl.style.color = '#00f5a0';
-                    motorSub.textContent = 'Spraying...';
-                    motorIcon.style.animation = 'spin 1s linear infinite';
-                } else {
-                    motorEl.textContent = 'IDLE';
-                    motorEl.style.color = '';
-                    motorSub.textContent = 'Ready';
-                    motorIcon.style.animation = '';
-                }
-
-                // Detection bar below video
-                const detLabel = document.getElementById('detectionLabel');
-                const detConf = document.getElementById('detectionConf');
-                detLabel.textContent = d.plant || 'Analyzing...';
-                detConf.textContent = `${(d.confidence || 0).toFixed(1)}%`;
-
-            } catch (err) {
-                // server might be offline, just skip
-            }
+        async function forceSpray() {
+            if (isSpraying) return;
+            
+            const btn = document.getElementById('forceSprayBtn');
+            isSpraying = true;
+            
+            btn.classList.add('spraying');
+            btn.innerHTML = '<span class="loading-spinner"></span><span>SPRAYING...</span>';
+            btn.disabled = true;
+            
+            document.getElementById('motorStatus').textContent = 'SPRAYING';
+            document.getElementById('motorStatus').style.color = 'var(--emerald-primary)';
+            document.getElementById('motorIconContainer').classList.add('spraying');
+            document.getElementById('motorSubtext').textContent = 'Manual spray in progress...';
+            document.getElementById('motorCard').classList.add('alert');
+            
+            await sendForceSpray();
+            
+            setTimeout(() => {
+                isSpraying = false;
+                btn.classList.remove('spraying');
+                btn.innerHTML = '<i class="fas fa-exclamation-triangle"></i><span data-i18n="force_spray">' + (translations[currentLanguage]?.force_spray || 'FORCE SPRAY') + '</span>';
+                btn.disabled = false;
+                
+                document.getElementById('motorStatus').textContent = 'IDLE';
+                document.getElementById('motorStatus').style.color = 'var(--text-primary)';
+                document.getElementById('motorIconContainer').classList.remove('spraying');
+                document.getElementById('motorSubtext').textContent = translations[currentLanguage]?.ready || 'Ready';
+                document.getElementById('motorCard').classList.remove('alert');
+            }, 3000);
         }
 
-        // ---- Poll activity log ----
-        async function refreshLogs() {
-            try {
-                const res = await fetch('/logs');
-                const logs = await res.json();
-
-                const body = document.getElementById('logBody');
-                const count = document.getElementById('logCount');
-                count.textContent = logs.length;
-
-                if (logs.length === 0) {
-                    body.innerHTML = '<div class="text-center text-muted py-3" style="font-size:0.85rem;">No activity yet.</div>';
-                    return;
+        function init() {
+            // Load language preference first
+            loadLanguagePreference();
+            
+            fetchStatus();
+            fetchLogs();
+            
+            setInterval(fetchStatus, 1000);
+            setInterval(fetchLogs, 5000);
+            
+            setInterval(() => {
+                if (Date.now() - lastFetchTime > 5000) {
+                    updateConnectionStatus(false);
                 }
-
-                const typeIcons = {
-                    success: 'fa-check',
-                    warning: 'fa-exclamation',
-                    error:   'fa-times',
-                    info:    'fa-info'
-                };
-
-                body.innerHTML = [...logs].reverse().map(entry => `
-                    <div class="log-entry ${entry.type}">
-                        <div class="log-icon ${entry.type}">
-                            <i class="fas ${typeIcons[entry.type] || 'fa-info'}"></i>
-                        </div>
-                        <div>
-                            <div class="log-text">${entry.message}</div>
-                            <div class="log-time">${entry.time}</div>
-                        </div>
-                    </div>
-                `).join('');
-
-            } catch (err) {
-                // just skip if server is down
-            }
+            }, 2000);
+            
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') closeOverlay();
+                if (e.key === ' ' || e.key === 'Enter') {
+                    if (document.getElementById('techOverlay').classList.contains('active')) {
+                        closeOverlay();
+                    }
+                }
+            });
+            
+            setTimeout(() => {
+                showToast('Plant AI Monitor connected!', 'success');
+            }, 1000);
         }
 
-        // ---- Spin animation for motor icon ----
-        const motorStyle = document.createElement('style');
-        motorStyle.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
-        document.head.appendChild(motorStyle);
-
-        // ---- Start polling ----
-        refreshStatus();
-        refreshLogs();
-        setInterval(refreshStatus, 1500);
-        setInterval(refreshLogs, 3000);
+        init();
     </script>
-
 </body>
 </html>
 """
-    return render_template_string(html_page)
 
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# -------------------------------------------------------
-# Entry point — start everything and run the server
-# -------------------------------------------------------
+@app.route('/status')
+def status():
+    return jsonify({
+        "motor": "ON" if motor_state else "OFF",
+        "plant": latest_plant_data["label"],
+        "confidence": round(latest_plant_data["confidence"], 1),
+        "moisture": latest_moisture,
+        "temperature": latest_temperature,
+        "humidity": latest_humidity,
+        "weather": latest_weather
+    })
+
+@app.route('/force_spray', methods=['POST'])
+def force():
+    global force_spray
+    force_spray = True
+    add_log("Force spray requested from dashboard", "warning")
+    return jsonify({"status": "activated"})
+
+def capture_frames():
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            frame_buffer.append(frame.copy())
+        time.sleep(0.01)
+
+def monitor_camera():
+    global cap
+    while True:
+        if not cap.isOpened():
+            print("WARNING: Camera disconnected. Attempting reconnect...")
+            add_log("Camera disconnected - attempting reconnect", "error")
+            cap.release()
+            time.sleep(2)
+            cap = cv2.VideoCapture(IP_CAM_URL)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, HD_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HD_HEIGHT)
+        time.sleep(5)
+
 if __name__ == '__main__':
-    # Open the webcam (0 = default camera)
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    if not cap.isOpened():
-        print("Error: Could not open webcam.")
-        exit()
-
-    print("Webcam opened successfully.")
-
-    # Start the AI processing thread
-    ai_thread = threading.Thread(target=process_frames_loop, daemon=True)
-    ai_thread.start()
-
-    # Start a thread to continuously grab frames from the webcam
-    def capture_loop():
-        while True:
-            ret, frame = cap.read()
-            if ret:
-                raw_frame_queue.append(frame)
-            time.sleep(0.03)  # ~30fps
-
-    capture_thread = threading.Thread(target=capture_loop, daemon=True)
-    capture_thread.start()
-
-    print("Starting Flask server on http://0.0.0.0:5000")
-    log_event("System started", "info")
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    IP_CAM_URL = "http://10.192.36.38:8080/video"
+    
+    cap = cv2.VideoCapture(IP_CAM_URL)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, HD_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HD_HEIGHT)
+    
+    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Camera resolution set to: {actual_width}x{actual_height}")
+    add_log(f"Camera initialized at {actual_width}x{actual_height}", "info")
+    
+    add_log("System initialized - Plant AI Monitor Started", "info")
+    add_log(f"AI Analysis Zone: {TARGET_SIZE}x{TARGET_SIZE} center ROI", "info")
+    
+    threading.Thread(target=process_frame, daemon=True).start()
+    threading.Thread(target=capture_frames, daemon=True).start()
+    threading.Thread(target=monitor_camera, daemon=True).start()
+    threading.Thread(target=weather_monitor, daemon=True).start()
+    add_log("Weather monitor started - checking Gunupur conditions", "info")
+    
+    print("======================================")
+    print(" Plant AI Monitor System Started")
+    print(f" HD Resolution: {HD_WIDTH}x{HD_HEIGHT}")
+    print(f" AI Target Box: {TARGET_SIZE}x{TARGET_SIZE} (center)")
+    print(" Dashboard: http://localhost:5000")
+    print(" Weather: Gunupur (wttr.in)")
+    print(" Multi-Language: en, hi, or, ta, te")
+    print("======================================")
+    
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        print("\nShutting down system...")
+        add_log("System shutdown initiated", "warning")
+    finally:
+        cap.release()
+        print("Camera released. System stopped.")
