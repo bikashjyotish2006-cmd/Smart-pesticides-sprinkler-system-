@@ -14,7 +14,9 @@ This folder contains the clean, human-written version of the project code.
 
 1. Update `LAPTOP_IP` in both `pi_client.py` and `dht22_client.py` with your laptop's local IP.
 2. Update the model file paths in `main.py` if your `.h5` files are in a different location.
-3. Make sure all dependencies from `requirements.txt` (in parent folder) are installed.
+3. if using phone camera then add the phone ipcam id in 'main.py' in the line 1866.
+4. if using raspberry pi camera feed then add the raspberry pi ip in the 'main.py's line no 1437.
+5. Make sure all dependencies from `requirements.txt` (in parent folder) are installed.
 
 ## Run Order
 
